@@ -3,11 +3,12 @@ All notable changes to this project will be documented in this file.
 This project adheres to [Semantic Versioning](http://semver.org/).
 
 ## [Unreleased]
+
+## [3.1.0] - 2024-05-23
 ### ADDED
 - Added new [options](./docs/client/options.md) under `http` which allows an optional configuration
   to be passed to the HTTP and HTTPS `Agent` used in `axios` requests. See
   [NodeJS 16.x - HTTP Agent options](https://nodejs.org/docs/latest-v16.x/api/http.html#new-agentoptions).
-
 
 ## [3.0.1] - 2024-03-21
 No changes have been made. The package was released with a new tag `3.0.1` as NPM does not allow package version to be
@@ -205,7 +206,7 @@ duplicated, even in the case where a package's version was unpublished. This is 
 ### ADDED
 - Alpha release
 
-[Unreleased]: https://github.com/widesky/jswidesky-client/compare/master...3.0.1
+[Unreleased]: https://github.com/widesky/jswidesky-client/compare/master...3.1.0
 [1.0.0]: https://github.com/widesky/jswidesky-client/compare/1.0.0...1.0.0
 [1.1.0]: https://github.com/widesky/jswidesky-client/compare/1.1.0...1.0.0
 [1.1.1]: https://github.com/widesky/jswidesky-client/compare/1.1.1...1.1.0
@@ -228,3 +229,4 @@ duplicated, even in the case where a package's version was unpublished. This is 
 [2.1.5]: https://github.com/widesky/jswidesky-client/compare/2.1.5...2.1.4
 [3.0.0]: https://github.com/widesky/jswidesky-client/compare/3.0.0...2.1.5
 [3.0.1]: https://github.com/widesky/jswidesky-client/compare/3.0.1...3.0.0
+[3.1.0]: https://github.com/widesky/jswidesky-client/compare/3.1.0...3.0.1
