@@ -75,6 +75,11 @@ class FakeHistoryServer {
             const raw = body && Array.isArray(body.rows) ? body.rows.map((r) => r.id) : [config.params.id];
             req = { uri, ids: raw.map((id) => String(id).replace(/^(r:|@)/, "").split(" ")[0]) };
             this.requests.push(req);
+            const readFault = this.faults.find((f) => f.times > 0 && f.match(req));
+            if (readFault) {
+                readFault.times -= 1;
+                throw readFault.makeError(req);
+            }
             const rows = req.ids.filter((id) => this.points.has(id)).map((id) => {
                 const tz = this.points.get(id).tz;
                 return tz === null ? { id: `r:${id}`, kind: "s:Number" } : { id: `r:${id}`, kind: "s:Number", tz: `s:${tz}` };
