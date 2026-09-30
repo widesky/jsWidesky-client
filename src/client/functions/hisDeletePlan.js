@@ -13,6 +13,8 @@ const DATE_ONLY_RE = /^\d{4}-\d{2}-\d{2}$/;
 // optional " TzName". The server requires the name after "+hh:mm"; "Z" alone means UTC.
 const DATETIME_RE = /^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?)(Z|[+-]\d{2}:\d{2})(?: (\S+))?$/;
 const ZONED_FORMAT = "YYYY-MM-DDTHH:mm:ss.SSSZ";
+const WALL_FORMAT = "YYYY-MM-DDTHH:mm:ss.SSS";
+const HOUR_MS = 3600000;
 
 const toIso = (ms) => new Date(ms).toISOString();
 
@@ -30,8 +32,65 @@ function ianaZone(hsTz) {
     return moment.tz.names().find((n) => n.split("/").pop() === name) || null;
 }
 
-// A boundary written in `iana` with the Haystack name the server needs after the offset.
-const zonedFormat = (iana, hsName) => (ms) => `${moment(ms).tz(iana).format(ZONED_FORMAT)} ${hsName}`;
+/**
+ * True when the wall time of `ms` in `zone` (a moment-timezone Zone) names more than one instant,
+ * i.e. `ms` falls in the hour a DST change repeats. The server reads a zero-offset token as wall
+ * time, so such an instant cannot be written in that form without guessing which one it picks.
+ */
+function isAmbiguousWall(zone, ms) {
+    const own = zone.utcOffset(ms);             // minutes, UTC = local + offset
+    const wall = ms - own * 60000;
+    for (const other of [zone.utcOffset(ms - 3 * HOUR_MS), zone.utcOffset(ms + 3 * HOUR_MS)]) {
+        if (other !== own && zone.utcOffset(wall + other * 60000) === other) return true;
+    }
+    return false;
+}
+
+/**
+ * A boundary form: `format(ms)` writes an instant as a range end, and `cuttable(ms)` says whether
+ * the server reads that token back as exactly `ms`.
+ *
+ * realOffset: `iana`'s real offset then the Haystack name ("...+10:00 Brisbane"). A token whose
+ *     offset is zero is read as wall time (see wallTime), so it is cuttable only when unambiguous.
+ */
+function realOffsetForm(iana, hsName) {
+    const zone = moment.tz.zone(iana);
+    return {
+        format: (ms) => `${moment(ms).tz(iana).format(ZONED_FORMAT)} ${hsName}`,
+        cuttable: (ms) => zone.utcOffset(ms) !== 0 || !isAmbiguousWall(zone, ms)
+    };
+}
+
+/**
+ * wallTime: local wall time in `iana`, then "+00:00 " and the Haystack name
+ * ("2026-09-01T00:00:00.000+00:00 Adelaide").
+ *
+ * DELIBERATE COUPLING to two API server behaviours (widesky-api-server):
+ *   1. HZincReader computes a datetime offset as tzHours*60 + tzMins*60 minutes, so a real
+ *      "+09:30 Adelaide" token is read as +39:00, about 29.5 h early;
+ *   2. timezoneSvc.timezoneEpoch applies the parsed offset only when it is non-zero, so a zero
+ *      offset with a zone name is read as local wall time in that zone.
+ * Date-only ranges in zones whose offset has non-zero minutes are therefore written in this form,
+ * which the server reads as the intended instant. A server fix to EITHER behaviour changes what
+ * these tokens mean; the live-stack check (test/integration/hisDelete-e2e.js, Adelaide points)
+ * pins it.
+ */
+function wallTimeForm(iana, hsName) {
+    const zone = moment.tz.zone(iana);
+    return {
+        format: (ms) => `${moment(ms).tz(iana).format(WALL_FORMAT)}+00:00 ${hsName}`,
+        cuttable: (ms) => !isAmbiguousWall(zone, ms)
+    };
+}
+
+const UTC_FORM = Object.freeze({ format: toIso, cuttable: () => true });
+
+// True when `zone`'s UTC offset has non-zero minutes at either end of [startMs, endMs] or in any
+// period that starts inside it.
+function hasPartHourOffset(zone, startMs, endMs) {
+    const at = [startMs, endMs, ...zone.untils.filter((u) => u > startMs && u < endMs)];
+    return at.some((ms) => zone.utcOffset(ms) % 60 !== 0);
+}
 
 function parseEnd(token) {
     const tok = token.trim();
@@ -85,25 +144,33 @@ function parseRange(range) {
  * whose sub-group has no mappable timezone (rule: send the caller's range verbatim).
  *   startMs/endMs      the absolute range, used for the COUNT histogram and to place boundaries;
  *   startTok/endTok    the first request's start and the last request's end in a split plan;
- *   format(ms)         an interior boundary (and a bisection midpoint) in the same form.
+ *   format(ms)         an interior boundary (and a bisection midpoint) in the same form;
+ *   cuttable(ms)       whether format(ms) is read back by the server as exactly ms (false only
+ *                      for a zero-offset token in the hour a DST change repeats).
+ * A "date" window whose zone has a part-hour offset is written as local wall time + "+00:00
+ * <Name>" (wallTimeForm); a "date" window whose own ends are not cuttable also returns null.
  */
 function windowFor(parsed, zone) {
     if (parsed.form === "utc") {
-        return { startMs: parsed.start.ms, endMs: parsed.end.ms, startTok: parsed.start.tok, endTok: parsed.end.tok, format: toIso };
+        return { startMs: parsed.start.ms, endMs: parsed.end.ms, startTok: parsed.start.tok, endTok: parsed.end.tok, ...UTC_FORM };
     }
     if (parsed.form === "named") {
         return {
             startMs: parsed.start.ms, endMs: parsed.end.ms, startTok: parsed.start.tok, endTok: parsed.end.tok,
-            format: zonedFormat(parsed.iana, parsed.start.tzName)
+            ...realOffsetForm(parsed.iana, parsed.start.tzName)
         };
     }
     if (!zone || !zone.iana) return null;
-    // Same instants as the server's HDate.midnight(start) and HDate.midnight(end + 1 day) in the
-    // point's timezone, so converting the ends does not change what is deleted.
+    // The instants the server gives the dates (HDate.midnight(start) and HDate.midnight(end + 1
+    // day), read as local wall time in the point's timezone). Counting and packing use them.
     const startMs = moment.tz(parsed.start.iso, "YYYY-MM-DD", zone.iana).valueOf();
     const endMs = moment.tz(parsed.end.iso, "YYYY-MM-DD", zone.iana).add(1, "day").valueOf();
-    const format = zonedFormat(zone.iana, zone.hsTz);
-    return { startMs, endMs, startTok: format(startMs), endTok: format(endMs), format };
+    // The tokens must be read back as those instants: whole-hour zones keep the real offset;
+    // zones with a part-hour offset anywhere in the window use wall time (see wallTimeForm).
+    const form = hasPartHourOffset(moment.tz.zone(zone.iana), startMs, endMs)
+        ? wallTimeForm(zone.iana, zone.hsTz) : realOffsetForm(zone.iana, zone.hsTz);
+    if (!form.cuttable(startMs) || !form.cuttable(endMs)) return null;
+    return { startMs, endMs, startTok: form.format(startMs), endTok: form.format(endMs), ...form };
 }
 
 /**
@@ -190,11 +257,12 @@ async function refineBucket(countFn, bucket, units, level, batchSize) {
  * Greedy-pack buckets under the budget. A new request may only start at a bucket edge strictly
  * inside the window; otherwise the bucket folds into the current request.
  */
-function interiorBoundaries(buckets, batchSize, startMs, endMs) {
+function interiorBoundaries(buckets, batchSize, window) {
+    const { startMs, endMs } = window;
     const boundaries = [];
     let running = 0;
     for (const b of buckets) {
-        const canCut = b.start > startMs && b.start < endMs;
+        const canCut = b.start > startMs && b.start < endMs && window.cuttable(b.start);
         if (running > 0 && running + b.count > batchSize && canCut) {
             boundaries.push(b.start);
             running = 0;
@@ -204,18 +272,18 @@ function interiorBoundaries(buckets, batchSize, startMs, endMs) {
     return boundaries;
 }
 
-// `range` is what is sent. startTok/endTok/format are the window's form, used whenever the
-// request is split, so every piece of a split stays in one server-accepted form.
+// `range` is what is sent. startTok/endTok/format/cuttable are the window's form, used whenever
+// the request is split, so every piece of a split stays in one server-accepted form.
 function makeRequest(ids, window, startTok, endTok, startMs, endMs, depth, range) {
     return {
-        ids, startTok, endTok, startMs, endMs, depth, format: window.format,
+        ids, startTok, endTok, startMs, endMs, depth, format: window.format, cuttable: window.cuttable,
         range: range || `s:${startTok},${endTok}`
     };
 }
 
 /** One request with the caller's range verbatim, never bisected (not plannable, or rule d). */
 function unplannedRequest(ids, raw) {
-    return { ids, startTok: null, endTok: null, startMs: NaN, endMs: NaN, depth: 0, format: null, range: `s:${raw}` };
+    return { ids, startTok: null, endTok: null, startMs: NaN, endMs: NaN, depth: 0, format: null, cuttable: null, range: `s:${raw}` };
 }
 
 /**
@@ -244,18 +312,21 @@ async function planGroup(countFn, ids, parsed, window, { batchSize, countBucketU
     for (const b of coarse) {
         buckets.push(...(await refineBucket(countFn, b, countBucketUnits, 0, batchSize)));
     }
-    return buildRequests(ids, parsed, window, interiorBoundaries(buckets, batchSize, window.startMs, window.endMs));
+    return buildRequests(ids, parsed, window, interiorBoundaries(buckets, batchSize, window));
 }
 
 /**
- * Halve a request at its midpoint, written in the request's own form. Returns null when it
+ * Halve a request at its midpoint, written in the request's own form. A midpoint the form cannot
+ * write unambiguously (a repeated DST hour) moves an hour later or earlier. Returns null when it
  * cannot be split (unplanned, or too short to halve).
  */
 function splitRequest(req) {
     if (!req.format) return null;
-    const mid = Math.floor((req.startMs + req.endMs) / 2);
-    if (!(mid > req.startMs && mid < req.endMs)) return null;
-    const window = { format: req.format };
+    const half = Math.floor((req.startMs + req.endMs) / 2);
+    const mid = [half, half + HOUR_MS, half - HOUR_MS]
+        .find((ms) => ms > req.startMs && ms < req.endMs && req.cuttable(ms));
+    if (mid === undefined) return null;
+    const window = { format: req.format, cuttable: req.cuttable };
     const midTok = req.format(mid);
     return [
         makeRequest(req.ids, window, req.startTok, midTok, req.startMs, mid, req.depth + 1),

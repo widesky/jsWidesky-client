@@ -2,6 +2,7 @@
 
 const expect = require("chai").expect;
 const stubs = require("../../../stubs");
+const moment = require("moment-timezone");
 const { FakeHistoryServer, haystackError, networkError } = require("./fakeHistoryServer");
 
 // Realistic point ids for a plant-room site.
@@ -177,7 +178,6 @@ describe("client.batch.hisDelete", () => {
         expect(deletes(fake)).to.have.length(2);
     });
     describe("ranges without an offset", () => {
-        const moment = require("moment-timezone");
         const BNE = "b1e2c3d4-0000-4a5b-8c9d-0000000000b1";   // tz Brisbane, UTC+10
         const NYC = "e5f6a7b8-0000-4a5b-8c9d-0000000000e5";   // tz New_York, UTC-4 in September
         const RANGE_LOCAL = "2026-09-01,2026-09-03";          // three whole local days
@@ -304,6 +304,93 @@ describe("client.batch.hisDelete", () => {
             expect(res.errors).to.eql([{ error: "Read failed", args: ["countQuery", [BNE, NYC], RANGE_LOCAL] }]);
             expect(deletes(fake)).to.eql([]);
             expect(fake.rows(BNE)).to.have.length(bne.rows.length);
+        });
+
+        describe("in a zone whose offset is not a whole number of hours", () => {
+            // The API server reads "+09:30" as +39:00 (HZincReader: tzHours*60 + tzMins*60 minutes)
+            // but reads a zero offset with a zone name as local wall time in that zone. A split
+            // plan for these zones writes local wall time + "+00:00 <Name>"; the fake resolves
+            // tokens exactly as the server does, so a wrong form deletes the wrong rows.
+            const ADL = "ad1e2c3d-0000-4a5b-8c9d-0000000000ad";   // Adelaide, +09:30 / +10:30 (DST)
+            const WALL_TOK = (name) => new RegExp(`^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}\\.\\d{3}\\+00:00 ${name}$`);
+
+            for (const [hsTz, ianaTz, range, first, last] of [
+                ["Adelaide", "Australia/Adelaide", RANGE_LOCAL, "2026-09-01", "2026-09-04"],
+                // Crosses Adelaide's DST start (2026-10-04 02:00, +09:30 -> +10:30).
+                ["Adelaide", "Australia/Adelaide", "2026-10-03,2026-10-05", "2026-10-03", "2026-10-06"],
+                ["Kathmandu", "Asia/Kathmandu", RANGE_LOCAL, "2026-09-01", "2026-09-04"],
+                ["St_Johns", "America/St_Johns", RANGE_LOCAL, "2026-09-01", "2026-09-04"]
+            ]) {
+                it(`deletes exactly the local days of ${range} on a ${hsTz} point, in wall-time tokens`, async () => {
+                    const [from, to] = [first, last].map((d) => moment.tz(d, ianaTz).valueOf());
+                    const rows = [from - 1, to];
+                    for (let ms = from; ms < from + HOUR; ms += 1000) rows.push(ms);
+                    for (let ms = from + HOUR; ms < to - HOUR; ms += MIN) rows.push(ms);
+                    for (let ms = to - HOUR; ms < to; ms += 1000) rows.push(ms);
+                    const { ws, fake } = client({ [ADL]: { tz: hsTz, rows } });
+                    const res = await ws.batch.hisDelete([ADL], range, { maxBisectDepth: 0 });
+                    expect(res.errors).to.eql([]);
+                    expect(fake.rows(ADL)).to.eql([from - 1, to]);
+                    const sent = deletes(fake);
+                    expect(sent.length).to.be.greaterThan(1);
+                    expect(ends(sent[0])[0]).to.equal(`${first}T00:00:00.000+00:00 ${hsTz}`);
+                    expect(ends(sent[sent.length - 1])[1]).to.equal(`${last}T00:00:00.000+00:00 ${hsTz}`);
+                    for (const r of sent) {
+                        for (const tok of ends(r)) expect(tok, tok).to.match(WALL_TOK(hsTz));
+                        expect(r.deleted[0], r.range).to.be.at.most(500);
+                    }
+                });
+            }
+
+            it("bisects an Adelaide date-only request at a wall-time midpoint", async () => {
+                const from = moment.tz("2026-09-01", "Australia/Adelaide").valueOf();
+                const rows = every(new Date(from).toISOString(), 1500, MIN);
+                const { ws, fake } = client({ [ADL]: { tz: "Adelaide", rows: [from - 1, ...rows] } });
+                fake.beforeFirstDelete((server) => {
+                    server.points.get(ADL).rows.push(...every(new Date(from + 2 * DAY).toISOString(), 400, MIN));
+                    server.points.get(ADL).rows.sort((a, b) => a - b);
+                });
+                const res = await ws.batch.hisDelete([ADL], RANGE_LOCAL, { batchSize: 1500 });
+                expect(res.errors).to.eql([]);
+                expect(fake.rows(ADL)).to.eql([from - 1]);
+                const sent = deletes(fake).map((r) => r.range);
+                expect(sent[0]).to.equal(`s:${RANGE_LOCAL}`);
+                expect(sent.slice(1)).to.eql([
+                    "s:2026-09-01T00:00:00.000+00:00 Adelaide,2026-09-02T12:00:00.000+00:00 Adelaide",
+                    "s:2026-09-02T12:00:00.000+00:00 Adelaide,2026-09-04T00:00:00.000+00:00 Adelaide"
+                ]);
+            });
+
+            it("never cuts inside the hour a DST change repeats when the token would be wall time", async () => {
+                // London falls back 2026-10-25 01:00Z: wall 01:00-02:00 GMT ("+00:00 London") occurs
+                // twice, so the server could read such a cut an hour early.
+                const LON = "1d0e2c3d-0000-4a5b-8c9d-00000000001d";
+                const from = moment.tz("2026-10-24", "Europe/London").valueOf();
+                const to = moment.tz("2026-10-26", "Europe/London").valueOf();
+                const rows = [from - 1, ...every(new Date(from).toISOString(), (to - from) / MIN, MIN), to];
+                const { ws, fake } = client({ [LON]: { tz: "London", rows } });
+                const res = await ws.batch.hisDelete([LON], "2026-10-24,2026-10-25", { batchSize: 30 });
+                expect(res.errors).to.eql([]);
+                expect(fake.rows(LON)).to.eql([from - 1, to]);
+                const toks = deletes(fake).flatMap(ends);
+                expect(toks.length).to.be.greaterThan(2);
+                expect(toks.filter((tok) => /^2026-10-25T01:\d{2}:\d{2}\.\d{3}\+00:00 London$/.test(tok))).to.eql([]);
+            });
+
+            it("keeps the real-offset form for a whole-hour zone in the same group", async () => {
+                const adl = localPoint("Adelaide", "Australia/Adelaide");
+                const bne = localPoint("Brisbane", "Australia/Brisbane");
+                const { ws, fake } = client({ [ADL]: adl, [BNE]: bne });
+                const res = await ws.batch.hisDelete([ADL, BNE], RANGE_LOCAL);
+                expect(res.errors).to.eql([]);
+                expect(fake.rows(ADL)).to.eql(adl.outside);
+                expect(fake.rows(BNE)).to.eql(bne.outside);
+                const mine = deletes(fake).filter((r) => r.ids.includes(BNE));
+                expect(mine.length).to.be.greaterThan(1);
+                for (const r of mine) {
+                    for (const tok of ends(r)) expect(tok, tok).to.match(/^2026-09-0\dT\d{2}:\d{2}:\d{2}\.\d{3}\+10:00 Brisbane$/);
+                }
+            });
         });
     });
 
