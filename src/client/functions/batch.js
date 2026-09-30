@@ -18,7 +18,7 @@ const {
 } = require("../../utils/evaluator");
 const lodash = require("lodash");
 const {
-    parseRange, groupByZone, windowFor, buildCountQuery, parseCountResponse, planGroup, unplannedRequest, splitRequest
+    parseRange, groupByZone, windowFor, buildCountQuery, parseCountResponse, planGroup, splitRequest
 } = require("./hisDeletePlan");
 const { withRetry, isRecordLimitError } = require("./hisDeleteRetry");
 const HisWritePayload = require("../../utils/hisWritePayload");
@@ -419,9 +419,11 @@ function chunkIds(ids, size) {
  *
  * Planning never reads the rows being deleted: each group of `batchSizeEntity` ids is counted
  * per `countBucketUnits[0]`, over-budget buckets are re-counted at finer units, and buckets are
- * packed into contiguous requests of at most `batchSize` rows per entity. A plan that needs one
- * request sends the caller's range verbatim. A split plan keeps every request in one range form
- * the API server accepts (see hisDeletePlan.parseRange):
+ * packed into contiguous requests of at most `batchSize` rows in total, over at most
+ * min(batchSizeEntity, batchSize) points. A bucket still over budget at the finest unit is halved
+ * and re-counted exactly until it fits. A plan that needs one request sends the caller's range
+ * verbatim ("today" / "yesterday" as the planned datetimes). A split plan keeps every request in
+ * one range form the API server accepts (see hisDeletePlan.parseRange):
  *   - both ends "...Z": boundaries are ISO "Z" instants, first/last keep the caller's tokens;
  *   - both ends "<offset> <TzName>" with the same name: boundaries in that zone with that name;
  *   - both ends dates: each group is read once and split by point timezone; both ends become
@@ -429,18 +431,20 @@ function chunkIds(ids, size) {
  *     written with the real offset in a whole-hour zone, or as local wall time + "+00:00 <Name>"
  *     in a zone with a part-hour offset in the window (the server misreads "+09:30"; see
  *     hisDeletePlan.wallTimeForm).
- * Any other range (relative keywords, mixed forms, a missing offset, seconds or tz name, two tz
- * names, "Z <Name>" for a zone other than UTC, "+00:00 <Name>" while that zone is not at UTC+0),
- * a date-only range on a point with no usable tz, a named range in a zone with a part-hour
- * offset, and a date or named range containing a sub-hour DST change, is sent verbatim as one
- * request per group for the server to accept or reject.
+ *   - "today" / "yesterday" and a single date plan like two dates, the keyword's date taken per
+ *     point timezone when the call starts.
+ * Any other range (one datetime, mixed forms, a missing offset, seconds or tz name, two tz names,
+ * "Z <Name>" for a zone other than UTC, "+00:00 <Name>" while that zone is not at UTC+0), a date
+ * range on a point with no usable tz, a named range in a zone with a part-hour offset, a date or
+ * named range containing a sub-hour DST change, and a group whose rows in a repeated DST hour
+ * exceed batchSize, is not sent: each such group gets a "plan" error and keeps its rows.
  *
  * @param {string|string[]} ids Point ids (array or single id).
  * @param {string|Date} range Haystack range string (with or without "s:"), or a Date for the start.
  * @param {Date|Object} [endOrOptions] Date end (not inclusive) when `range` is a Date; otherwise the
  *     options, with the keys listed under maybeOptions.
  * @param {Object} [maybeOptions] Options when called with two Dates. See docs/client/batch.md.
- * @param {number} [maybeOptions.batchSize=500] Most rows per entity in one request.
+ * @param {number} [maybeOptions.batchSize=500] Most rows in one request, summed over its points.
  * @param {number} [maybeOptions.batchSizeEntity=10] Most point ids in one request.
  * @param {number} [maybeOptions.maxBisectDepth=5] Times a request the server rejects for its row
  *     limit may be halved.
@@ -452,8 +456,9 @@ function chunkIds(ids, size) {
  * @param {number} [maybeOptions.parallelDelay] Milliseconds between parallel starts.
  * @param {boolean} [maybeOptions.returnResult=false] Collect each delete response in `success`.
  * @returns {Promise<{success: Array, errors: Array<{error: String, args: Array}>}>}
- *          errors[].args[0] is "hisDelete" for a failed delete and "countQuery" for a failed
- *          count; a group whose count fails is not deleted.
+ *          errors[].args[0] is "hisDelete" for a failed delete, "countQuery" for a failed
+ *          count (the group is not deleted), and "plan" for a range or group that cannot be cut
+ *          within batchSize (nothing is sent for it).
  */
 async function hisDelete(ids, range, endOrOptions, maybeOptions) {
     let options;
@@ -486,11 +491,20 @@ async function hisDelete(ids, range, endOrOptions, maybeOptions) {
     const success = [];
     const errors = [];
     const requests = [];
+    // Relative ranges resolve against one "now" for the whole call.
+    const nowMs = Date.now();
+    // A range that cannot be cut into requests of at most batchSize rows is not sent at all.
+    const notSent = (groupIds, reason) => {
+        this.logger.warn("batch.hisDelete: not deleting %s over %s: %s", groupIds.join(","), range, reason);
+        errors.push({ error: `not sent: ${reason}`, args: ["plan", groupIds, range] });
+    };
 
-    for (const group of chunkIds(ids, batchSizeEntity)) {
+    // At most batchSize points per request as well: points often log on the same instants, and
+    // rows sharing one millisecond cannot be split by time.
+    for (const group of chunkIds(ids, Math.min(batchSizeEntity, resolved.batchSize))) {
         if (!parsed.plannable) {
-            this.logger.debug("batch.hisDelete: range %s is not plannable; one request per group, no bisection", range);
-            requests.push(unplannedRequest(group, parsed.raw));
+            notSent(group, `"${parsed.raw}" is not a range batch.hisDelete can split: use two dates, one date, ` +
+                "today, yesterday, or two datetimes with seconds and the same timezone name");
             continue;
         }
         // Datetime ends carry their own timezone, so the whole group shares one window. Date-only
@@ -505,21 +519,26 @@ async function hisDelete(ids, range, endOrOptions, maybeOptions) {
             }
         }
         for (const sub of subGroups) {
-            const window = windowFor(parsed, sub);
+            const window = windowFor(parsed, sub, nowMs);
             if (window.unsplittable) {
-                this.logger.warn("batch.hisDelete: %s for %s; sending %s as one unplanned request",
-                    window.unsplittable, sub.ids.join(","), range);
-                requests.push(unplannedRequest(sub.ids, parsed.raw));
+                notSent(sub.ids, window.unsplittable);
                 continue;
             }
             // Planning queries retry like deletes: a caller who sets retries expects planning to
             // ride out the same transient failures.
             const countFn = async (fromMs, toMs, unit) => parseCountResponse(
                 await withRetry(() => this.query(buildCountQuery(sub.ids, fromMs, toMs, unit)), { retries, retryDelay }), unit);
+            let plan;
             try {
-                requests.push(...(await planGroup(countFn, sub.ids, parsed, window, resolved)));
+                plan = await planGroup(countFn, sub.ids, parsed, window, resolved);
             } catch (error) {
                 errors.push({ error: error.message, args: ["countQuery", sub.ids, range] });
+                continue;
+            }
+            if (plan.overBudget) {
+                notSent(sub.ids, plan.overBudget);
+            } else {
+                requests.push(...plan.requests);
             }
         }
     }
@@ -730,7 +749,7 @@ async function updateByFilter(filter, criteriaList, options={}) {
  * @param {Date} end Ending timestamp to be deleted (not inclusive).
  * @param {Object} [options] Options for batch.hisDelete plus `limit` (see docs/client/batch.md). Options not given
  *                come from client config batch.hisDeleteByFilter, then its defaults; batch.hisDelete client
- *                config does not apply on this path. batchSize bounds the rows per entity per request.
+ *                config does not apply on this path. batchSize bounds the total rows per request.
  * @returns {Promise<{success: Array, errors: Array<{errors: String, args: Array}>}>}
  *          - success: Return the result of each successful hisDelete operation when options.returnResult is true.
  *          - errors: Return any errors encountered when performing hisDelete operations.

@@ -3,6 +3,7 @@
 const expect = require("chai").expect;
 const stubs = require("../../../stubs");
 const moment = require("moment-timezone");
+const sinon = require("sinon");
 const { FakeHistoryServer, haystackError, networkError } = require("./fakeHistoryServer");
 
 // Realistic point ids for a plant-room site.
@@ -47,7 +48,7 @@ describe("client.batch.hisDelete", () => {
             expect(fake.rows(PT.chwFlowTemp)).to.eql([...outsideBefore, ...outsideAfter].sort((a, b) => a - b));
         });
 
-        it("keeps every request within the per-entity row budget", async () => {
+        it("keeps every request within the row budget", async () => {
             await ws.batch.hisDelete([PT.chwFlowTemp], RANGE);
             const sizes = deletes(fake).map((r) => r.deleted[0]);
             expect(Math.max(...sizes)).to.be.at.most(500);
@@ -126,6 +127,49 @@ describe("client.batch.hisDelete", () => {
         });
         await ws.batch.hisDelete([PT.chwReturnTemp], RANGE, { batchSize: 5 });
         expect(fake.rows(PT.chwReturnTemp)).to.eql([]);
+    });
+
+    it("keeps the rows of each request within batchSize summed over all its points", async () => {
+        // Each point alone (400 rows) fits the 500-row budget; together (1200) they do not.
+        const points = Object.fromEntries([PT.chwFlowTemp, PT.chwReturnTemp, PT.boilerKw]
+            .map((id) => [id, { rows: every("2026-09-01T00:00:00Z", 400, 10 * MIN) }]));
+        const { ws, fake } = client(points);
+        const res = await ws.batch.hisDelete(Object.keys(points), RANGE);
+        expect(res.errors).to.eql([]);
+        const totals = deletes(fake).map((r) => r.deleted.reduce((a, b) => a + b, 0));
+        expect(Math.max(...totals)).to.be.at.most(500);
+        expect(totals.reduce((a, b) => a + b, 0)).to.equal(1200);
+        for (const r of deletes(fake)) expect(r.ids).to.have.length(3);
+        for (const id of Object.keys(points)) expect(fake.rows(id)).to.eql([]);
+    });
+
+    it("keeps a minute whose rows are bunched at its start within batchSize", async () => {
+        // 5 meters logging 4 rows/s from 05:00:00 to 05:02:30: the 05:02 minute holds 600 rows, all
+        // in its first 30 s, so equal time slices of that minute would put 400 rows in the first.
+        const meters = Array.from({ length: 5 }, (_, i) => `e1ec7a1c-3b2d-4c5e-9f60-00000000000${i}`);
+        const points = Object.fromEntries(meters.map((id) => [id, { rows: every("2026-09-02T05:00:00Z", 600, 250) }]));
+        const { ws, fake } = client(points);
+        const res = await ws.batch.hisDelete(meters, RANGE, { batchSize: 200 });
+        expect(res.errors).to.eql([]);
+        const totals = deletes(fake).map((r) => r.deleted.reduce((a, b) => a + b, 0));
+        expect(Math.max(...totals)).to.be.at.most(200);
+        expect(totals.reduce((a, b) => a + b, 0)).to.equal(3000);
+        for (const id of meters) expect(fake.rows(id)).to.eql([]);
+    });
+
+    it("puts fewer points in a request when batchSize is below batchSizeEntity", async () => {
+        // 10 points logging on the same minute stamps: 10 rows share every instant, so a 4-row
+        // budget can only hold if a request names at most 4 points.
+        const ids = Array.from({ length: 10 }, (_, i) => `a11a57a0-3b2d-4c5e-9f60-0000000000${String(i).padStart(2, "0")}`);
+        const points = Object.fromEntries(ids.map((id) => [id, { rows: every("2026-09-01T00:00:00Z", 30, MIN) }]));
+        const { ws, fake } = client(points);
+        const res = await ws.batch.hisDelete(ids, RANGE, { batchSize: 4 });
+        expect(res.errors).to.eql([]);
+        for (const r of deletes(fake)) {
+            expect(r.ids.length, r.range).to.be.at.most(4);
+            expect(r.deleted.reduce((a, b) => a + b, 0), r.range).to.be.at.most(4);
+        }
+        for (const id of ids) expect(fake.rows(id)).to.eql([]);
     });
 
     it("groups entities by batchSizeEntity and counts each group once per level", async () => {
@@ -216,7 +260,7 @@ describe("client.batch.hisDelete", () => {
             const { ws, fake } = two();
             await ws.batch.hisDelete([BNE, NYC], RANGE_LOCAL, { maxBisectDepth: 0 });
             for (const r of deletes(fake)) {
-                expect(Math.max(...r.deleted), r.range).to.be.at.most(500);
+                expect(r.deleted.reduce((a, b) => a + b, 0), r.range).to.be.at.most(500);
             }
         });
 
@@ -275,25 +319,22 @@ describe("client.batch.hisDelete", () => {
             ]);
         });
 
-        it("sends the caller's range verbatim, unsplit, for a point with no or an unmappable timezone", async () => {
+        it("reports and does not delete from points with no or an unmappable timezone", async () => {
             const NOTZ = "0a0b0c0d-0000-4a5b-8c9d-00000000000a";
             const ODDTZ = "0a0b0c0d-0000-4a5b-8c9d-00000000000b";
-            // The fake resolves a date-only range in UTC for these points; the server decides.
-            const from = Date.parse("2026-09-01T00:00:00Z"), to = Date.parse("2026-09-04T00:00:00Z");
-            const rows = [from - 1, ...every("2026-09-01T00:00:00Z", 3 * 24, HOUR), to];
+            const rows = every("2026-09-01T00:00:00Z", 3 * 24, HOUR);
             const { ws, fake } = client({ [NOTZ]: { tz: null, rows }, [ODDTZ]: { tz: "Mawson_Station", rows }, [BNE]: localPoint("Brisbane", "Australia/Brisbane") });
-            const warn = ws.logger.warn;   // StubLogger already stubs warn; read its recorded calls
             const res = await ws.batch.hisDelete([NOTZ, ODDTZ, BNE], RANGE_LOCAL);
-            expect(res.errors).to.eql([]);
-            expect(fake.rows(NOTZ)).to.eql([from - 1, to]);
-            expect(fake.rows(ODDTZ)).to.eql([from - 1, to]);
+            expect(res.errors.map((e) => e.args)).to.eql([["plan", [NOTZ], RANGE_LOCAL], ["plan", [ODDTZ], RANGE_LOCAL]]);
+            for (const e of res.errors) expect(e.error).to.match(/^not sent: no usable timezone/);
+            expect(fake.rows(NOTZ)).to.eql(rows);
+            expect(fake.rows(ODDTZ)).to.eql(rows);
             for (const id of [NOTZ, ODDTZ]) {
-                expect(deletes(fake).filter((r) => r.ids.includes(id)).map((r) => r.range), id).to.eql([`s:${RANGE_LOCAL}`]);
+                expect(deletes(fake).some((r) => r.ids.includes(id)), id).to.be.false;
                 expect(counts(fake).some((r) => r.ids.includes(id)), id).to.be.false;
             }
             // The Brisbane point in the same group is still planned and split.
             expect(deletes(fake).filter((r) => r.ids.includes(BNE)).length).to.be.greaterThan(1);
-            expect(warn.getCalls().filter((c) => c.args.join(" ").includes("one unplanned request"))).to.have.length(2);
         });
 
         it("skips a group whose timezone read fails, and deletes nothing from it", async () => {
@@ -369,7 +410,8 @@ describe("client.batch.hisDelete", () => {
                 const to = moment.tz("2026-10-26", "Europe/London").valueOf();
                 const rows = [from - 1, ...every(new Date(from).toISOString(), (to - from) / MIN, MIN), to];
                 const { ws, fake } = client({ [LON]: { tz: "London", rows } });
-                const res = await ws.batch.hisDelete([LON], "2026-10-24,2026-10-25", { batchSize: 30 });
+                // 61: the 00:59Z minute (BST) plus the 60 GMT minutes that cannot be cut from it.
+                const res = await ws.batch.hisDelete([LON], "2026-10-24,2026-10-25", { batchSize: 61 });
                 expect(res.errors).to.eql([]);
                 expect(fake.rows(LON)).to.eql([from - 1, to]);
                 const toks = deletes(fake).flatMap(ends);
@@ -403,42 +445,27 @@ describe("client.batch.hisDelete", () => {
         const BNE = "b0e1a2c3-0000-4a5b-8c9d-0000000000b0";
         const minuteRows = (fromMs, days) => Array.from({ length: days * 1440 }, (_, i) => fromMs + i * MIN);
 
-        it("sends a +10:00 Adelaide named range as one verbatim request", async () => {
-            const range = "2026-06-01T00:00:00+10:00 Adelaide,2026-06-04T00:00:00+10:00 Adelaide";
-            const from = t("2026-06-01T00:00:00+10:00"), to = t("2026-06-04T00:00:00+10:00");
-            const rows = minuteRows(from - 2 * DAY, 7);
-            const { ws, fake } = client({ [ADL]: { tz: "Adelaide", rows } }, { recordLimit: 100000 });
-            const res = await ws.batch.hisDelete([ADL], range);
-            expect(res.errors).to.eql([]);
-            expect(counts(fake)).to.eql([]);
-            expect(deletes(fake).map((r) => r.range)).to.eql([`s:${range}`]);
-            // Whatever the one request deletes is what the fake says it deletes: the caller's
-            // whole range, and no rows before it.
-            expect(fake.rows(ADL)).to.eql(rows.filter((ms) => ms < from || ms >= to));
-        });
-
-        it("sends a date-only range containing Lord_Howe's 30-minute DST change as one verbatim request", async () => {
+        for (const [label, id, tz, range, days, reason] of [
+            ["a +10:00 Adelaide named range", ADL, "Adelaide",
+                "2026-06-01T00:00:00+10:00 Adelaide,2026-06-04T00:00:00+10:00 Adelaide", "2026-05-30", /part-hour UTC offset/],
             // Lord_Howe springs forward 2026-10-04 02:00 (+10:30 -> +11:00).
-            const from = moment.tz("2026-10-03", "Australia/Lord_Howe").valueOf();
-            const to = moment.tz("2026-10-06", "Australia/Lord_Howe").valueOf();
-            const rows = minuteRows(from - DAY, 5);
-            const { ws, fake } = client({ [LHI]: { tz: "Lord_Howe", rows } }, { recordLimit: 100000 });
-            const res = await ws.batch.hisDelete([LHI], "2026-10-03,2026-10-05");
-            expect(res.errors).to.eql([]);
-            expect(counts(fake)).to.eql([]);
-            expect(deletes(fake).map((r) => r.range)).to.eql(["s:2026-10-03,2026-10-05"]);
-            expect(fake.rows(LHI)).to.eql(rows.filter((ms) => ms < from || ms >= to));
-        });
-
-        it("sends a Lord_Howe named range containing its April DST change as one verbatim request", async () => {
+            ["a date-only range containing Lord_Howe's 30-minute DST change", LHI, "Lord_Howe",
+                "2026-10-03,2026-10-05", "2026-10-02", /not a whole number of hours/],
             // DST ends 2026-04-05 02:00 local (+11:00 -> +10:30).
-            const range = "2026-04-04T00:00:00+11:00 Lord_Howe,2026-04-07T00:00:00+11:00 Lord_Howe";
-            const rows = minuteRows(t("2026-04-03T00:00:00+11:00"), 5);
-            const { ws, fake } = client({ [LHI]: { tz: "Lord_Howe", rows } }, { recordLimit: 100000 });
-            await ws.batch.hisDelete([LHI], range);
-            expect(counts(fake)).to.eql([]);
-            expect(deletes(fake).map((r) => r.range)).to.eql([`s:${range}`]);
-        });
+            ["a Lord_Howe named range containing its April DST change", LHI, "Lord_Howe",
+                "2026-04-04T00:00:00+11:00 Lord_Howe,2026-04-07T00:00:00+11:00 Lord_Howe", "2026-04-03", /not a whole number of hours/]
+        ]) {
+            it(`reports ${label} and deletes nothing`, async () => {
+                const rows = minuteRows(t(`${days}T00:00:00Z`), 7);
+                const { ws, fake } = client({ [id]: { tz, rows } });
+                const res = await ws.batch.hisDelete([id], range);
+                expect(res.errors.map((e) => e.args)).to.eql([["plan", [id], range]]);
+                expect(res.errors[0].error).to.match(reason);
+                expect(counts(fake)).to.eql([]);
+                expect(deletes(fake)).to.eql([]);
+                expect(fake.rows(id)).to.eql(rows);
+            });
+        }
 
         it("still plans a Lord_Howe date-only range with no DST change, in wall-time tokens", async () => {
             const from = moment.tz("2026-09-01", "Australia/Lord_Howe").valueOf();
@@ -472,41 +499,79 @@ describe("client.batch.hisDelete", () => {
         }
     });
 
-    describe("ranges the planner does not split", () => {
-        // Each is sent verbatim, one request per group, and the server decides. The fake rejects
-        // them exactly as the API server's HDateTimeRange.make does, so the error is reported.
-        for (const [range, error] of [
-            ["2026-09-01,2026-09-04T00:00:00Z", "Invalid HDateTimeRange: 2026-09-01,2026-09-04T00:00:00Z"],
-            ["2026-09-01T00:00:00+10:00,2026-09-04T00:00:00+10:00", "Expected space between timezone offset and name"],
-            ["2026-09-01T00:00:00,2026-09-04T00:00:00", "Expected -/+ for timezone offset"],
-            ["2026-09-01T00:00:00+10:00 Brisbane,2026-09-04T00:00:00+10:00 Sydney", "arg1.tz != arg2.tz"],
-            // The server requires seconds in a datetime.
-            ["2026-09-01T00:00Z,2026-09-04T00:00Z", "Expected ':' for time value (char=0x5a 'Z')"],
-            ["2026-09-01T00:00+10:00 Brisbane,2026-09-04T00:00+10:00 Brisbane", "Expected ':' for time value (char=0x2b '+')"]
-        ]) {
-            it(`sends ${range} as one unplanned request`, async () => {
-                const { ws, fake } = client({ [PT.chwFlowTemp]: { tz: "Brisbane", rows: every("2026-09-01T00:00:00Z", 3 * 1440, MIN) } });
-                const res = await ws.batch.hisDelete([PT.chwFlowTemp], range);
-                expect(counts(fake)).to.eql([]);
-                expect(deletes(fake).map((r) => r.range)).to.eql([`s:${range}`]);
-                expect(res.errors).to.eql([{ error, args: ["hisDelete", [PT.chwFlowTemp], `s:${range}`] }]);
-            });
-        }
+    describe("a repeated daylight-saving hour", () => {
+        // London falls back 2026-10-25 02:00 BST -> 01:00 GMT. The GMT pass of 01:00-02:00 would be
+        // written "+00:00 London", which the server reads as the earlier (BST) pass, so no cut can
+        // go there.
+        const LDN = "10d0e1f2-0000-4a5b-8c9d-0000000010d0";
+        const RANGE_LDN = "2026-10-24,2026-10-26";
+        const bst = every("2026-10-25T00:10:00Z", 600, 1000);   // 01:10-01:20 BST: cuttable
+        const gmt = every("2026-10-25T01:10:00Z", 600, 1000);   // 01:10-01:20 GMT: not cuttable
 
-        // The server ignores a zero offset and reads the wall time in the named zone, so these
-        // name an instant other than the ISO one whenever the zone is not at UTC+0 then.
-        for (const [range, fromWall, toWall] of [
-            ["2026-09-01T00:00:00Z London,2026-09-04T00:00:00Z London", "Europe/London"],
-            ["2026-09-01T00:00:00+00:00 New_York,2026-09-04T00:00:00+00:00 New_York", "America/New_York"]
-        ].map(([r, z]) => [r, moment.tz("2026-09-01", z).valueOf(), moment.tz("2026-09-04", z).valueOf()])) {
-            it(`sends ${range} as one unplanned request, and the server's reading decides`, async () => {
-                const rows = [fromWall - 1, ...every(new Date(fromWall).toISOString(), 3 * 1440, MIN), toWall];
-                const { ws, fake } = client({ [PT.chwFlowTemp]: { tz: "Brisbane", rows } }, { recordLimit: 5000 });
-                const res = await ws.batch.hisDelete([PT.chwFlowTemp], range);
-                expect(res.errors).to.eql([]);
+        it("reports a group whose rows in that hour exceed batchSize, and deletes nothing", async () => {
+            const { ws, fake } = client({ [LDN]: { tz: "London", rows: [...bst, ...gmt] } });
+            const res = await ws.batch.hisDelete([LDN], RANGE_LDN, { batchSize: 200 });
+            expect(res.errors.map((e) => e.args)).to.eql([["plan", [LDN], RANGE_LDN]]);
+            expect(res.errors[0].error).to.match(/^not sent: .*more than batchSize \(200\) rows/);
+            expect(deletes(fake)).to.eql([]);
+            expect(fake.rows(LDN)).to.eql([...bst, ...gmt]);
+        });
+
+        it("cuts before the hour when the first bucket of the range sits right before it", async () => {
+            // 2026-10-25 in London opens 2026-10-24T23:00Z (BST midnight): 150 rows in that first
+            // UTC hour (the first, clipped DAY bucket), nothing at 00:xxZ, 100 rows in the GMT pass
+            // and 150 at noon, so the 10-25 UTC day is over budget and counted by the hour.
+            const first = every("2026-10-24T23:10:00Z", 150, 1000);
+            const inHour = every("2026-10-25T01:10:00Z", 100, 1000);
+            const noon = every("2026-10-25T12:10:00Z", 150, 1000);
+            const { ws, fake } = client({ [LDN]: { tz: "London", rows: [...first, ...inHour, ...noon] } });
+            const res = await ws.batch.hisDelete([LDN], "2026-10-25", { batchSize: 200, countBucketUnits: ["DAY", "HOUR"] });
+            expect(res.errors).to.eql([]);
+            expect(deletes(fake).map((r) => r.deleted[0])).to.eql([150, 100, 150]);
+            expect(fake.rows(LDN)).to.eql([]);
+        });
+
+        it("still plans the range when that hour fits in batchSize", async () => {
+            // 02:00 GMT is not repeated, so a cut can go there, between the hour and later rows.
+            const later = every("2026-10-25T03:00:00Z", 600, 1000);
+            const { ws, fake } = client({ [LDN]: { tz: "London", rows: [...gmt, ...later] } });
+            const res = await ws.batch.hisDelete([LDN], RANGE_LDN, { batchSize: 600 });
+            expect(res.errors).to.eql([]);
+            expect(deletes(fake).length).to.be.greaterThan(1);
+            for (const r of deletes(fake)) expect(r.deleted[0], r.range).to.be.at.most(600);
+            expect(fake.rows(LDN)).to.eql([]);
+        });
+    });
+
+    describe("ranges the planner does not split", () => {
+        // None of these can be cut into requests of at most batchSize rows, so none is sent: each
+        // group gets one "plan" error and keeps its rows.
+        for (const range of [
+            "2026-09-01,2026-09-04T00:00:00Z",
+            "2026-09-01T00:00:00+10:00,2026-09-04T00:00:00+10:00",
+            "2026-09-01T00:00:00,2026-09-04T00:00:00",
+            "2026-09-01T00:00:00+10:00 Brisbane,2026-09-04T00:00:00+10:00 Sydney",
+            // The server requires seconds in a datetime.
+            "2026-09-01T00:00Z,2026-09-04T00:00Z",
+            "2026-09-01T00:00+10:00 Brisbane,2026-09-04T00:00+10:00 Brisbane",
+            // The server ignores a zero offset and reads the wall time in the named zone, so these
+            // name an instant other than the ISO one whenever the zone is not at UTC+0 then.
+            "2026-09-01T00:00:00Z London,2026-09-04T00:00:00Z London",
+            "2026-09-01T00:00:00+00:00 New_York,2026-09-04T00:00:00+00:00 New_York",
+            // A single datetime runs to "now", which the client cannot pin.
+            "2026-09-01T00:00:00Z"
+        ]) {
+            it(`reports ${range} and deletes nothing`, async () => {
+                const rows = every("2026-09-01T00:00:00Z", 3 * 1440, MIN);
+                const ids = [PT.chwFlowTemp, PT.chwReturnTemp];
+                const { ws, fake } = client(Object.fromEntries(ids.map((id) => [id, { tz: "Brisbane", rows }])));
+                const res = await ws.batch.hisDelete(ids, `s:${range}`);
+                expect(res.errors).to.have.length(1);
+                expect(res.errors[0].args).to.eql(["plan", ids, `s:${range}`]);
+                expect(res.errors[0].error).to.match(/^not sent: .* is not a range batch\.hisDelete can split/);
                 expect(counts(fake)).to.eql([]);
-                expect(deletes(fake).map((r) => r.range)).to.eql([`s:${range}`]);
-                expect(fake.rows(PT.chwFlowTemp)).to.eql([fromWall - 1, toWall]);
+                expect(deletes(fake)).to.eql([]);
+                for (const id of ids) expect(fake.rows(id)).to.eql(rows);
             });
         }
 
@@ -596,15 +661,43 @@ describe("client.batch.hisDelete", () => {
     });
 
     describe("relative ranges", () => {
-        it("sends yesterday as one request per group without counting", async () => {
-            const id = PT.chwFlowTemp;
-            const moment = require("moment-timezone");
-            const yStart = moment.tz(Date.parse("2026-09-30T02:00:00Z"), "UTC").startOf("day").subtract(1, "day").valueOf();
-            const { ws, fake } = client({ [id]: { rows: [yStart - 1, ...every(new Date(yStart).toISOString(), 1440, MIN)] } });
-            await ws.batch.hisDelete([id], "yesterday");
-            expect(counts(fake)).to.eql([]);
-            expect(deletes(fake).map((r) => r.range)).to.eql(["s:yesterday"]);
-            expect(fake.rows(id)).to.eql([yStart - 1]);
+        // The fake's "now" (2026-09-30T02:00Z) is 12:00 in Brisbane and 22:00 the day before in
+        // New York, so "today" and "yesterday" are different dates in the two zones.
+        const NOW = Date.parse("2026-09-30T02:00:00Z");
+        const BNE = "b0e1a2c3-0000-4a5b-8c9d-0000000000b1", NYC = "4e0a1b2c-0000-4a5b-8c9d-0000000000e1";
+        let clock;
+        beforeEach(() => { clock = sinon.useFakeTimers({ now: NOW, toFake: ["Date"] }); });
+        afterEach(() => clock.restore());
+
+        for (const [keyword, bneDay, nycDay] of [["yesterday", "2026-09-29", "2026-09-28"], ["today", "2026-09-30", "2026-09-29"]]) {
+            it(`resolves ${keyword} to explicit dates in each point's timezone and plans them`, async () => {
+                const day = (d, z) => [moment.tz(d, z).valueOf(), moment.tz(d, z).add(1, "day").valueOf()];
+                const [bFrom, bTo] = day(bneDay, "Australia/Brisbane"), [nFrom, nTo] = day(nycDay, "America/New_York");
+                const minutes = (from, to) => Array.from({ length: (to - from) / MIN }, (_, i) => from + i * MIN);
+                const { ws, fake } = client({
+                    [BNE]: { tz: "Brisbane", rows: [bFrom - 1, ...minutes(bFrom, bTo), bTo] },
+                    [NYC]: { tz: "New_York", rows: [nFrom - 1, ...minutes(nFrom, nTo), nTo] }
+                });
+                const res = await ws.batch.hisDelete([BNE, NYC], keyword);
+                expect(res.errors).to.eql([]);
+                expect(fake.rows(BNE)).to.eql([bFrom - 1, bTo]);
+                expect(fake.rows(NYC)).to.eql([nFrom - 1, nTo]);
+                expect(counts(fake).length).to.be.greaterThan(0);
+                for (const r of deletes(fake)) {
+                    expect(r.range).to.not.include(keyword);
+                    expect(r.deleted.reduce((a, b) => a + b, 0), r.range).to.be.at.most(500);
+                }
+            });
+        }
+
+        it("plans a single date as that whole day", async () => {
+            const [from, to] = [moment.tz("2026-09-01", "Australia/Brisbane").valueOf(), moment.tz("2026-09-02", "Australia/Brisbane").valueOf()];
+            const rows = [from - 1, ...every(new Date(from).toISOString(), 1440, MIN), to];
+            const { ws, fake } = client({ [BNE]: { tz: "Brisbane", rows } });
+            const res = await ws.batch.hisDelete([BNE], "2026-09-01");
+            expect(res.errors).to.eql([]);
+            expect(deletes(fake).length).to.be.greaterThan(1);
+            expect(fake.rows(BNE)).to.eql([from - 1, to]);
         });
     });
 

@@ -78,7 +78,7 @@ The Object in `client.batch.hisDelete` is expected to have the following structu
 
 | Path from `client.batch.hisDelete` | Description                                                                                                                                                             |  Type   |            Default             |
 |------------------------------------|-------------------------------------------------------------------------------------------------------------------------------------------------------------------------|:-------:|:------------------------------:|
-| `batchSize`                        | Define the maximum number of rows to be deleted per entity in a single `hisDelete` request. Between 1 and 3000.                                                         | Number  |              500               |
+| `batchSize`                        | Define the maximum number of rows to be deleted in a single `hisDelete` request, across all its entities. Between 1 and 3000.                                                         | Number  |              500               |
 | `batchSizeEntity`                  | Define the maximum number of entities in a single `hisDelete` request. Between 1 and 1000.                                                                              | Number  |               10               |
 | `maxBisectDepth`                   | Define how many times a request rejected for exceeding the record limit may be halved and retried. `0` reports the request as an error instead. Between 0 and 10.       | Number  |               5                |
 | `countBucketUnits`                 | Define the time units used to count rows, from coarsest to finest. Must be a non-empty list of GraphQL `duration` values, coarse to fine, without duplicates.           |  Array  | `["DAY", "HOUR", "MINUTE"]`    |
@@ -96,35 +96,37 @@ At debug level the client logs every resolved option once per call, together wit
 the client configuration or the default. A call option of `null` counts as not supplied.
 
 #### How the range is planned
-Ids are split into groups of `batchSizeEntity`, in the order given, and each group is planned on its own. Every group
-is planned (its row counts requested) before any delete is sent.
+Every request holds at most `batchSize` rows in total, across at most `batchSizeEntity` entities. Ids are split into
+groups of `batchSizeEntity` (or of `batchSize`, if that is smaller, because entities often log at the same instants
+and rows that share an instant cannot be split by time), in the order given, and each group is planned on its own.
+Every group is planned (its row counts requested) before any delete is sent. A range, or a group, that cannot be cut
+into requests within `batchSize` is not sent at all: it is reported in `errors` as `"plan"` and its rows are kept.
 
-1. Only three range forms are planned, because every request of a split plan must use one form the server accepts:
+1. Only these range forms are planned, because every request of a split plan must use one form the server accepts:
    - two datetimes ending in `Z` (or `Z UTC`), e.g. `2026-06-01T00:00:00Z,2026-06-04T00:00:00Z`;
    - two datetimes with an offset and the same timezone name, e.g.
      `2026-06-01T00:00:00+10:00 Brisbane,2026-06-04T00:00:00+10:00 Brisbane`;
-   - two dates, e.g. `2026-06-01,2026-06-03`.
+   - two dates, e.g. `2026-06-01,2026-06-03`, or one date, e.g. `2026-06-01`;
+   - `today` or `yesterday`, which become that date in each point's timezone, taken when the call starts.
 
    Datetimes must include seconds (`T00:00:00`, not `T00:00`), as the server requires.
 
-   Any other range is not planned: relative ranges such as `today` or `yesterday`, a single value, a date paired with a
-   datetime, a datetime without an offset or without seconds, an offset without a timezone name, two different
-   timezone names, or a range that cannot be parsed. Also not planned: `Z` followed by a timezone name other than
-   `UTC`, and `+00:00` followed by a timezone name where that timezone is not at UTC+0 at that time. The server reads
-   both as local time in the named timezone, not as UTC. It is sent exactly as given, as one request per group,
-   whatever its length, and cannot be halved. The server accepts or rejects it; a rejection is reported in `errors`
-   as a failed `hisDelete`.
+   Any other range is not sent: a single datetime, a date paired with a datetime, a datetime without an offset or
+   without seconds, an offset without a timezone name, two different timezone names, or a range that cannot be parsed.
+   Also not sent: `Z` followed by a timezone name other than `UTC`, and `+00:00` followed by a timezone name where
+   that timezone is not at UTC+0 at that time. The server reads both as local time in the named timezone, not as UTC.
 2. The server is asked for row counts over the range, in buckets of the first unit in `countBucketUnits`. A bucket
-   counts as the highest row count of any entity in the group, since the server's limit applies per entity.
+   counts as the rows of all the entities in the group added together, since `batchSize` limits a whole request.
 3. Any bucket above `batchSize` is counted again in the next finer unit. A bucket still above `batchSize` at the finest
-   unit is split into equal slices.
-4. Buckets are packed oldest first into requests that keep each entity at or below `batchSize` rows.
+   unit is halved, and the first half counted exactly (the second holds the rest), until every piece fits.
+4. Buckets are packed oldest first into requests of at most `batchSize` rows in total across their entities.
 5. The requests are contiguous and together cover the whole range, so rows written while the delete is running still
    fall inside a request.
-6. When the plan needs only one request, that request sends the range exactly as you gave it. When it is split,
-   every request uses the same form, and together they delete the same rows as a single `client.hisDelete` of your
-   range. Some ranges are never split, because the server would misread the cuts; each is sent as one request exactly
-   as given, not halved, and a warning is logged (see "Ranges left unsplit" below):
+6. When the plan needs only one request, that request sends the range exactly as you gave it (`today` and
+   `yesterday` are sent as the planned datetimes, so the server cannot resolve them to another day). When it is
+   split, every request uses the same form, and together they delete the same rows as a single `client.hisDelete` of
+   your range. Some ranges cannot be split, because the server would misread the cuts; those are not sent (see
+   "Ranges that are not sent" below):
    - `Z` datetimes: the first request keeps your start, the last keeps your end, and the cuts between them are `Z`
      datetimes;
    - datetimes with a timezone name: the first and last requests keep your start and end, and the cuts are datetimes in
@@ -147,7 +149,7 @@ point's timezone name, in one of two forms:
   a `+00:00` offset with a timezone name as local time in that timezone, so this form deletes the intended rows. If the
   server's handling of either changes, this form must change with it.
 
-Ranges left unsplit, beyond the unplanned forms in step 1:
+Ranges that are not sent, beyond the forms in step 1:
 - A range of datetimes with a timezone name, in a timezone with a part-hour offset at any time in the range (for example
   `2026-06-01T00:00:00+10:00 Adelaide,2026-06-04T00:00:00+10:00 Adelaide`, even though you wrote a whole-hour offset).
   The cuts would need the real `+09:30`, which the server misreads by about 29.5 hours.
@@ -156,19 +158,21 @@ Ranges left unsplit, beyond the unplanned forms in step 1:
 - A date range where an end of the window falls in the hour that repeats when daylight saving ends, in a zone that would
   be written with a `+00:00` offset.
 
-No cut is placed in the hour that repeats when daylight saving ends, if the cut would be written with a `+00:00`
-offset, because that local time names two instants. A point with no timezone, or one the client cannot map to a known
-timezone, is not planned: its range is sent exactly as given, as one request, and a warning is logged.
+- A date range (or `today` / `yesterday`) for a point with no timezone, or one the client cannot map to a known
+  timezone.
+- A group whose rows in the hour that repeats when daylight saving ends are more than `batchSize`, where cuts would
+  be written with a `+00:00` offset. No cut is placed in that hour, because that local time names two instants.
 
 #### Failures and retries
 All planned requests are attempted. Failures do not stop the others; they are collected in `errors`, and requests that
 succeeded are kept in `success` when `returnResult` is `true`. Each error has the form `{ error: String, args: Array }`,
-and `args[0]` tells the two kinds apart:
+and `args[0]` tells the kinds apart:
 
 | `args[0]`      | Meaning                                                                                                             | `args`                        |
 |----------------|---------------------------------------------------------------------------------------------------------------------|-------------------------------|
 | `"hisDelete"`  | A delete request failed. Nothing further is done for that request.                                                  | `["hisDelete", ids, range]`   |
 | `"countQuery"` | Counting (or reading timezones) for a group failed. The group is skipped and nothing is deleted for its entities.   | `["countQuery", ids, range]`  |
+| `"plan"`       | The range, or the group, cannot be cut into requests within `batchSize`. Nothing is sent for those entities.        | `["plan", ids, range]`        |
 
 Row counts and timezone reads are retried like delete requests, with the same `retries` and `retryDelay`.
 
@@ -284,7 +288,7 @@ The Object in `client.batch.hisDeleteByFilter` is expected to have the following
 
 | Path from `client.batch.hisDeleteByFilter` | Description                                                                                                                  |  Type   |           Default           |
 |--------------------------------------------|------------------------------------------------------------------------------------------------------------------------------|:-------:|:---------------------------:|
-| `batchSize`                                | Define the maximum number of rows to be deleted per entity in a single `hisDelete` request. Between 1 and 3000.              | Number  |             500             |
+| `batchSize`                                | Define the maximum number of rows to be deleted in a single `hisDelete` request, across all its entities. Between 1 and 3000.              | Number  |             500             |
 | `batchSizeEntity`                          | Define the maximum number of entities in a single `hisDelete` request. Between 1 and 1000.                                   | Number  |             10              |
 | `maxBisectDepth`                           | As for `client.batch.hisDelete`.                                                                                             | Number  |              5              |
 | `countBucketUnits`                         | As for `client.batch.hisDelete`.                                                                                             |  Array  | `["DAY", "HOUR", "MINUTE"]` |

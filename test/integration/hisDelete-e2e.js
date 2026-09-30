@@ -238,9 +238,11 @@ function yesterdayBuild() {
                 const ids = H.idsOfBody(d.body);
                 expect(ids.length, `${label}: ids per delete request`).to.be.at.most(opts.batchSizeEntity || BATCH_SIZE_ENTITY);
             }
-            const maxRows = H.maxRowsPerRequest(ok.map((d) => d.body), snapshots, tzOf, nowMs);
-            // +1: one row may sit on a boundary shared by two adjacent windows.
-            expect(maxRows, `${label}: rows per request`).to.be.at.most(opts.batchSize + 1);
+            for (const r of H.rowsPerRequest(ok.map((d) => d.body), snapshots, tzOf, nowMs)) {
+                // + ids: each point may have one row on a boundary shared by two adjacent windows.
+                expect(r.rows, `${label}: rows summed over the points of ${r.range}`)
+                    .to.be.at.most(opts.batchSize + r.ids.length);
+            }
             return { X, Y, seen };
         } finally {
             ws._wsRawSubmit = raw;

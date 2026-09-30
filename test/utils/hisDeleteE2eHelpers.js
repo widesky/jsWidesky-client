@@ -139,7 +139,7 @@ describe("hisDelete e2e helpers", () => {
         });
     });
 
-    describe("maxRowsPerRequest", () => {
+    describe("rowsPerRequest", () => {
         const T0 = Date.parse("2026-06-01T00:00:00Z");
         const snapshots = {
             pA: [T0, T0 + 1000, T0 + 2000, T0 + 3000, T0 + 4000],
@@ -148,24 +148,28 @@ describe("hisDelete e2e helpers", () => {
         const tzOf = { pA: "Brisbane", pB: "New_York" };
         const body = (range, ...ids) => ({ rows: [{ ...Object.fromEntries(ids.map((id, i) => [i === 0 ? "id" : `id${i}`, `r:${id} Some point`])), range: `s:${range}` }] });
 
-        it("returns the largest per-id in-range count across requests", () => {
+        it("sums each request's in-range rows over its ids", () => {
             const bodies = [
-                body("2026-06-01T00:00:00Z,2026-06-01T00:00:01Z", "pA", "pB"),          // pA 2, pB 1
+                body("2026-06-01T00:00:00Z,2026-06-01T00:00:01Z", "pA", "pB"),          // pA 2 + pB 1
                 body("2026-06-01T00:00:00Z,2026-06-01T00:00:04Z", "pA"),                // pA 5
             ];
-            expect(H.maxRowsPerRequest(bodies, snapshots, tzOf, NOW)).to.equal(5);
+            expect(H.rowsPerRequest(bodies, snapshots, tzOf, NOW)).to.eql([
+                { range: "s:2026-06-01T00:00:00Z,2026-06-01T00:00:01Z", ids: ["pA", "pB"], rows: 3 },
+                { range: "s:2026-06-01T00:00:00Z,2026-06-01T00:00:04Z", ids: ["pA"], rows: 5 },
+            ]);
         });
 
         it("resolves each id's range in its own zone", () => {
             // Date-only range: Brisbane midnight 05-31T14Z, New_York 06-01T04Z; pB rows fall before New_York's start.
             const r = "2026-06-01,2026-06-01";
-            expect(H.maxRowsPerRequest([body(r, "pB")], snapshots, tzOf, NOW)).to.equal(0);
-            expect(H.maxRowsPerRequest([body(r, "pA")], snapshots, {pA: "New_York"}, NOW)).to.equal(0);
-            expect(H.maxRowsPerRequest([body(r, "pA")], snapshots, tzOf, NOW)).to.equal(5);
+            const rows = (b, tz) => H.rowsPerRequest([b], snapshots, tz, NOW)[0].rows;
+            expect(rows(body(r, "pB"), tzOf)).to.equal(0);
+            expect(rows(body(r, "pA"), {pA: "New_York"})).to.equal(0);
+            expect(rows(body(r, "pA"), tzOf)).to.equal(5);
         });
 
         it("throws on an unknown id", () => {
-            expect(() => H.maxRowsPerRequest([body("2026-06-01T00:00:00Z,2026-06-02T00:00:00Z", "pZ")], snapshots, tzOf, NOW))
+            expect(() => H.rowsPerRequest([body("2026-06-01T00:00:00Z,2026-06-02T00:00:00Z", "pZ")], snapshots, tzOf, NOW))
                 .to.throw(/unknown id pZ/);
         });
     });

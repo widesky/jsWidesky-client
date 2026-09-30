@@ -17,6 +17,7 @@ const ZERO_OFFSET_RE = /^(Z|[+-]00:00)$/;
 const ZONED_FORMAT = "YYYY-MM-DDTHH:mm:ss.SSSZ";
 const WALL_FORMAT = "YYYY-MM-DDTHH:mm:ss.SSS";
 const HOUR_MS = 3600000;
+const MIN_MS = 60000;
 
 /**
  * How a window's range ends are written. Every request of one split plan uses one form.
@@ -38,12 +39,14 @@ const HOUR_MS = 3600000;
 /**
  * A caller's range classified for planning (see parseRange).
  * @typedef {Object} ParsedRange
- * @property {boolean} plannable false when the range must be sent verbatim.
+ * @property {boolean} plannable false when the range cannot be split, so it is not sent.
  * @property {string} raw The range without its "s:" prefix.
  * @property {"utc"|"named"|"date"} [form] How the range is planned (plannable only).
  * @property {RangeEnd} [start] The first end (plannable only).
  * @property {RangeEnd} [end] The second end (plannable only).
  * @property {string} [iana] The IANA zone of a "named" range.
+ * @property {"today"|"yesterday"} [relative] Set for a relative "date" range; its dates are
+ *     resolved per point timezone against "now" (see windowFor) and always sent as datetimes.
  */
 
 /**
@@ -57,8 +60,8 @@ const HOUR_MS = 3600000;
 /**
  * The window a (sub-)group is planned over (see windowFor), or why it cannot be cut.
  * @typedef {Object} PlanWindow
- * @property {string} [unsplittable] Set instead of every other field when the window is sent
- *     verbatim as one request.
+ * @property {string} [unsplittable] Set instead of every other field when the window cannot be
+ *     cut; the reason is reported and nothing is sent.
  * @property {number} [startMs] Start instant in epoch ms.
  * @property {number} [endMs] End instant in epoch ms.
  * @property {string} [startTok] The first request's start token.
@@ -68,24 +71,24 @@ const HOUR_MS = 3600000;
  */
 
 /**
- * One COUNT histogram bucket, counted as the most rows any one entity has in it.
+ * One COUNT histogram bucket, counted as the rows of all the group's entities in it.
  * @typedef {Object} Bucket
  * @property {number} start Bucket start in epoch ms (inclusive).
  * @property {number} end Bucket end in epoch ms (exclusive).
- * @property {number} count Rows of the busiest entity in the bucket.
+ * @property {number} count Rows in the bucket, summed over the group's entities.
  */
 
 /**
  * One planned hisDelete request.
  * @typedef {Object} DeleteRequest
  * @property {string[]} ids Point ids, at most batchSizeEntity of them.
- * @property {string|null} startTok Start token in the window's form (null when unplanned).
- * @property {string|null} endTok End token in the window's form (null when unplanned).
- * @property {number} startMs Start in epoch ms (NaN when unplanned).
- * @property {number} endMs End in epoch ms (NaN when unplanned).
+ * @property {string} startTok Start token in the window's form.
+ * @property {string} endTok End token in the window's form.
+ * @property {number} startMs Start in epoch ms.
+ * @property {number} endMs End in epoch ms.
  * @property {number} depth Times this request has been bisected.
- * @property {?function(number): string} format Boundary writer, or null when unplanned.
- * @property {?function(number): boolean} cuttable Boundary check, or null when unplanned.
+ * @property {function(number): string} format Boundary writer, see BoundaryForm.
+ * @property {function(number): boolean} cuttable Boundary check, see BoundaryForm.
  * @property {string} range The "s:start,end" range that is sent.
  */
 
@@ -215,7 +218,7 @@ function hasSubHourTransition(zone, startMs, endMs) {
 }
 
 /**
- * Why a window in `iana` cannot be cut (rule d: one request, the caller's range verbatim), or null.
+ * Why a window in `iana` cannot be cut (so it is not sent), or null.
  * `named` callers write real offsets, which the server misreads whenever they carry minutes.
  * @param {string} iana IANA zone of the window.
  * @param {number} startMs Window start in epoch ms.
@@ -269,18 +272,28 @@ function parseEnd(token) {
  *   "utc"   both ends "...Z": interior boundaries are ISO "Z" instants;
  *   "named" both ends "<offset> <TzName>" with the same, mappable name: interior boundaries are
  *           written in that zone with that name;
- *   "date"  both ends dates: per timezone sub-group, both ends become local-midnight datetimes
+ *   "date"  both ends dates, one date (that day), or "today" / "yesterday" (that day in each
+ *           point's timezone): per timezone sub-group, both ends become local-midnight datetimes
  *           (the end is the day after the end date) with the point's tz name (see windowFor).
- * Anything else (relative keywords, one value, mixed forms, an offset without a name, a datetime
+ * Anything else (other keywords, one datetime, mixed forms, an offset without a name, a datetime
  * without an offset or without seconds, "Z <Name>" for a zone other than UTC, "+00:00 <Name>"
  * where that zone is not at UTC+0, two different names, an empty or inverted range) is not
- * plannable: the caller's range is sent verbatim, one request per group, and the server decides.
+ * plannable, and batch.hisDelete does not send it.
  * @param {string} range Haystack range, with or without "s:".
  * @returns {ParsedRange}
  */
 function parseRange(range) {
     const raw = range.startsWith("s:") ? range.slice(2) : range;
+    if (raw === "today" || raw === "yesterday") {
+        return { plannable: true, raw, form: "date", relative: raw };
+    }
     const parts = raw.split(",");
+    if (parts.length === 1) {
+        const day = parseEnd(parts[0]);
+        return day && day.kind === "date"
+            ? { plannable: true, raw, form: "date", start: day, end: day }
+            : { plannable: false, raw };
+    }
     if (parts.length !== 2) return { plannable: false, raw };
     const start = parseEnd(parts[0]);
     const end = parseEnd(parts[1]);
@@ -300,9 +313,10 @@ function parseRange(range) {
 
 /**
  * The window a (sub-)group is planned over, and how its request ends are written. `zone` is the
- * sub-group's {iana, hsTz} for a "date" range, ignored otherwise. Returns null for a "date" range
- * whose sub-group has no mappable timezone. A window that cannot be cut at all returns
- * `{ unsplittable: <reason> }` (rule d: send the caller's range verbatim, one request).
+ * sub-group's {iana, hsTz} for a "date" range, ignored otherwise. A window that cannot be cut at
+ * all (including a "date" range whose sub-group has no mappable timezone) returns
+ * `{ unsplittable: <reason> }`, and batch.hisDelete does not send it. A relative range's day is
+ * the day of `nowMs` in the point's timezone ("yesterday": the day before).
  *   startMs/endMs      the true instants of the range, used for the COUNT histogram and to place
  *                      boundaries (for a "date" range, the local midnights the server gives the
  *                      dates in the point's timezone);
@@ -320,9 +334,10 @@ function parseRange(range) {
  * @param {ParsedRange} parsed A plannable range.
  * @param {ZoneGroup|{ids: string[]}} zone The sub-group being planned; its iana and hsTz are
  *     used for a "date" range only.
+ * @param {number} nowMs "Now" in epoch ms, for a relative range.
  * @returns {PlanWindow}
  */
-function windowFor(parsed, zone) {
+function windowFor(parsed, zone, nowMs) {
     if (parsed.form === "utc") {
         return { startMs: parsed.start.ms, endMs: parsed.end.ms, startTok: parsed.start.tok, endTok: parsed.end.tok, ...UTC_FORM };
     }
@@ -337,8 +352,14 @@ function windowFor(parsed, zone) {
     if (!zone || !zone.iana) return { unsplittable: `no usable timezone (${zone && zone.hsTz})` };
     // The instants the server gives the dates (HDate.midnight(start) and HDate.midnight(end + 1
     // day), read as local wall time in the point's timezone). Counting and packing use them.
-    const startMs = moment.tz(parsed.start.iso, "YYYY-MM-DD", zone.iana).valueOf();
-    const endMs = moment.tz(parsed.end.iso, "YYYY-MM-DD", zone.iana).add(1, "day").valueOf();
+    let [startIso, endIso] = [parsed.start && parsed.start.iso, parsed.end && parsed.end.iso];
+    if (parsed.relative) {
+        const day = moment.tz(nowMs, zone.iana).startOf("day");
+        if (parsed.relative === "yesterday") day.subtract(1, "day");
+        startIso = endIso = day.format("YYYY-MM-DD");
+    }
+    const startMs = moment.tz(startIso, "YYYY-MM-DD", zone.iana).valueOf();
+    const endMs = moment.tz(endIso, "YYYY-MM-DD", zone.iana).add(1, "day").valueOf();
     const reason = unsplittableReason(zone.iana, startMs, endMs, false);
     if (reason) return { unsplittable: reason };
     // The tokens must be read back as those instants: whole-hour zones keep the real offset;
@@ -392,8 +413,8 @@ function buildCountQuery(ids, fromMs, toMs, unit) {
 }
 
 /**
- * Turn a COUNT histogram response into buckets. A bucket's count is the maximum across the
- * group's entities, because the API limit applies per entity.
+ * Turn a COUNT histogram response into buckets. A bucket's count is the sum across the group's
+ * entities, because batchSize bounds the rows of a whole request, not of each entity in it.
  * @param {Object} response The GraphQL response of buildCountQuery.
  * @param {string} unit The query's bucket unit (sets each bucket's end).
  * @returns {Bucket[]} Non-empty buckets, oldest first.
@@ -410,7 +431,7 @@ function parseCountResponse(response, unit) {
             const start = Number(p.time);
             const count = parseInt(p.value, 10);
             if (!Number.isFinite(start) || !(count > 0)) continue;
-            byStart.set(start, Math.max(byStart.get(start) || 0, count));
+            byStart.set(start, (byStart.get(start) || 0) + count);
         }
     }
     return [...byStart.entries()]
@@ -419,38 +440,45 @@ function parseCountResponse(response, unit) {
 }
 
 /**
- * A bucket still over budget at the finest level is uniform enough at that scale to split
- * arithmetically (CORE-9414 splitBucketByTime).
- * @param {Bucket} bucket An over-budget bucket at the finest unit.
- * @param {number} batchSize Rows per entity per request.
- * @returns {Bucket[]} Equal time slices with estimated counts.
+ * Halve an over-budget bucket and count each half exactly, repeating until every piece holds at
+ * most `batchSize` rows. The server counts a range as [from, to) to the millisecond whatever the
+ * bucket unit, so a COUNT over a piece, summed across its buckets, is its exact row count. Only
+ * the left half is counted: the right half holds the rest. A piece of 1 ms cannot be halved; it
+ * holds at most one row per entity, which hisDelete keeps within batchSize by capping the
+ * entities per request at batchSize.
+ * @param {CountFn} countFn Counts the group's rows.
+ * @param {Bucket} bucket A bucket with an exact count, clipped to the window.
+ * @param {number} batchSize Most rows in one request, summed over its entities.
+ * @returns {Promise<Bucket[]>} Non-empty pieces, oldest first.
  */
-function splitBucketByTime(bucket, batchSize) {
-    const slices = Math.ceil(bucket.count / batchSize);
-    if (slices <= 1) return [bucket];
-    const sliceMs = Math.ceil((bucket.end - bucket.start) / slices);
-    const perSlice = Math.ceil(bucket.count / slices);
+async function halveBucket(countFn, bucket, batchSize) {
+    if (bucket.count <= batchSize || bucket.end - bucket.start < 2) return [bucket];
+    const mid = Math.floor((bucket.start + bucket.end) / 2);
+    const leftCount = (await countFn(bucket.start, mid, "WEEK")).reduce((n, b) => n + b.count, 0);
+    const halves = [
+        { start: bucket.start, end: mid, count: leftCount },
+        { start: mid, end: bucket.end, count: bucket.count - leftCount }
+    ];
     const out = [];
-    for (let i = 0; i < slices; i++) {
-        const start = bucket.start + i * sliceMs;
-        if (start >= bucket.end) break;
-        out.push({ start, end: Math.min(start + sliceMs, bucket.end), count: perSlice });
+    for (const half of halves.filter((h) => h.count > 0)) {
+        out.push(...(await halveBucket(countFn, half, batchSize)));
     }
     return out;
 }
 
 /**
- * Re-count an over-budget bucket at the next finer unit, recursively, until every bucket fits.
+ * Re-count an over-budget bucket at the next finer unit, recursively, then halve any bucket
+ * still over budget at the finest unit (see halveBucket), until every bucket fits.
  * @param {CountFn} countFn Counts the group's rows.
  * @param {Bucket} bucket The bucket to refine.
  * @param {string[]} units countBucketUnits, coarsest first.
  * @param {number} level Index of `bucket`'s unit in `units`.
- * @param {number} batchSize Rows per entity per request.
+ * @param {number} batchSize Most rows in one request, summed over its entities.
  * @returns {Promise<Bucket[]>}
  */
 async function refineBucket(countFn, bucket, units, level, batchSize) {
     if (bucket.count <= batchSize) return [bucket];
-    if (level >= units.length - 1) return splitBucketByTime(bucket, batchSize);
+    if (level >= units.length - 1) return halveBucket(countFn, bucket, batchSize);
     const finer = await countFn(bucket.start, bucket.end, units[level + 1]);
     if (finer.length === 0) return [bucket];
     const out = [];
@@ -461,24 +489,71 @@ async function refineBucket(countFn, bucket, units, level, batchSize) {
 }
 
 /**
+ * Before each run of buckets that cannot start a request (a repeated DST hour), make the unit the
+ * run is packed with (see interiorBoundaries) as small as a cut allows: find the latest instant
+ * before the run that the window's form can write. If it falls in the empty gap after the bucket
+ * before the run, a zero-row marker starts there; if it falls inside that bucket, the bucket is
+ * split there and its tail counted exactly. Instants are tried 1 ms before the run, then back a
+ * minute at a time, for up to 3 hours. A repeated DST hour lasts at most an hour, so 3 hours
+ * always reaches a writable instant; this is a property of timezones, not a site preference, so
+ * it is not configurable.
+ * @param {CountFn} countFn Counts the group's rows.
+ * @param {Bucket[]} buckets Buckets oldest first, clipped to the window.
+ * @param {PlanWindow} window The window being split.
+ * @returns {Promise<Bucket[]>}
+ */
+async function splitBeforeUncuttable(countFn, buckets, window) {
+    const canStart = (ms) => ms > window.startMs && ms < window.endMs && window.cuttable(ms);
+    const out = [];
+    for (const b of buckets) {
+        const prev = out[out.length - 1];
+        // prev leads a unit when it can start a request or is the window's first bucket.
+        if (prev && !canStart(b.start) && (out.length === 1 || canStart(prev.start))) {
+            const candidates = [b.start - 1, ...Array.from({ length: 180 }, (_, k) => b.start - (k + 1) * MIN_MS)];
+            const cut = candidates.find((ms) => ms > prev.start && canStart(ms));
+            if (cut !== undefined && cut >= prev.end) {
+                out.push({ start: cut, end: b.start, count: 0 });
+            } else if (cut !== undefined) {
+                const tail = (await countFn(cut, prev.end, "WEEK")).reduce((n, x) => n + x.count, 0);
+                out.pop();
+                if (prev.count - tail > 0) out.push({ start: prev.start, end: cut, count: prev.count - tail });
+                out.push({ start: cut, end: prev.end, count: tail });
+            }
+        }
+        out.push(b);
+    }
+    return out;
+}
+
+/**
  * Greedy-pack buckets under the budget. A new request may only start at a bucket edge strictly
- * inside the window; otherwise the bucket folds into the current request.
+ * inside the window that the window's form can write (see BoundaryForm). A bucket that cannot
+ * start a request is packed as one unit with the bucket before it, so the packer cuts before the
+ * whole run rather than filling a request up to it and then having to add the run as well.
  * @param {Bucket[]} buckets Buckets oldest first.
- * @param {number} batchSize Rows per entity per request.
+ * @param {number} batchSize Most rows in one request, summed over its entities.
  * @param {PlanWindow} window The window being split.
  * @returns {number[]} Cut instants in epoch ms, ascending.
  */
 function interiorBoundaries(buckets, batchSize, window) {
     const { startMs, endMs } = window;
-    const boundaries = [];
-    let running = 0;
+    const units = [];
     for (const b of buckets) {
         const canCut = b.start > startMs && b.start < endMs && window.cuttable(b.start);
-        if (running > 0 && running + b.count > batchSize && canCut) {
-            boundaries.push(b.start);
+        if (canCut || units.length === 0) {
+            units.push({ start: b.start, count: b.count, canCut });
+        } else {
+            units[units.length - 1].count += b.count;
+        }
+    }
+    const boundaries = [];
+    let running = 0;
+    for (const u of units) {
+        if (running > 0 && running + u.count > batchSize && u.canCut) {
+            boundaries.push(u.start);
             running = 0;
         }
-        running += b.count;
+        running += u.count;
     }
     return boundaries;
 }
@@ -504,18 +579,9 @@ function makeRequest(ids, window, startTok, endTok, startMs, endMs, depth, range
 }
 
 /**
- * One request with the caller's range verbatim, never bisected (not plannable, or rule d).
- * @param {string[]} ids Point ids.
- * @param {string} raw The caller's range without "s:".
- * @returns {DeleteRequest}
- */
-function unplannedRequest(ids, raw) {
-    return { ids, startTok: null, endTok: null, startMs: NaN, endMs: NaN, depth: 0, format: null, cuttable: null, range: `s:${raw}` };
-}
-
-/**
  * Requests for a window cut at `boundaries`. With no boundary the one request sends the caller's
- * range verbatim (it still carries the window's form, for bisection).
+ * range verbatim (it still carries the window's form, for bisection), except a relative range:
+ * that is sent as the planned datetimes, so the server cannot resolve it to another day.
  * @param {string[]} ids Point ids.
  * @param {ParsedRange} parsed The caller's range.
  * @param {PlanWindow} window The window being split.
@@ -524,7 +590,8 @@ function unplannedRequest(ids, raw) {
  */
 function buildRequests(ids, parsed, window, boundaries) {
     if (boundaries.length === 0) {
-        return [makeRequest(ids, window, window.startTok, window.endTok, window.startMs, window.endMs, 0, `s:${parsed.raw}`)];
+        const range = parsed.relative ? undefined : `s:${parsed.raw}`;
+        return [makeRequest(ids, window, window.startTok, window.endTok, window.startMs, window.endMs, 0, range)];
     }
     const edges = [
         { tok: window.startTok, ms: window.startMs },
@@ -539,29 +606,47 @@ function buildRequests(ids, parsed, window, boundaries) {
 }
 
 /**
- * Plan one (sub-)group: count it, refine over-budget buckets and pack them into requests.
+ * Plan one (sub-)group: count it, refine over-budget buckets and pack them into requests. A
+ * bucket that cannot be cut from the one before it (a repeated DST hour, see BoundaryForm) joins
+ * that request; if that takes a request over batchSize, the group is not planned.
  * @param {CountFn} countFn Counts the group's rows.
  * @param {string[]} ids Point ids.
  * @param {ParsedRange} parsed The caller's range.
  * @param {PlanWindow} window The window to plan over.
  * @param {Object} options Resolved batch.hisDelete options.
- * @param {number} options.batchSize Rows per entity per request.
+ * @param {number} options.batchSize Most rows in one request, summed over its entities.
  * @param {string[]} options.countBucketUnits Histogram units, coarsest first.
- * @returns {Promise<DeleteRequest[]>}
+ * @returns {Promise<{requests: DeleteRequest[]}|{overBudget: string}>} The requests, or why the
+ *     group cannot be cut into requests of at most batchSize rows.
  */
 async function planGroup(countFn, ids, parsed, window, { batchSize, countBucketUnits }) {
-    const coarse = await countFn(window.startMs, window.endMs, countBucketUnits[0]);
+    // Buckets are aligned to their unit, so the first and last can reach outside the counted
+    // range. Clip them, so a re-count of a bucket never counts rows outside the window.
+    const clipped = async (fromMs, toMs, unit) => (await countFn(fromMs, toMs, unit))
+        .map((b) => ({ start: Math.max(b.start, fromMs), end: Math.min(b.end, toMs), count: b.count }));
+    const coarse = await clipped(window.startMs, window.endMs, countBucketUnits[0]);
     const buckets = [];
     for (const b of coarse) {
-        buckets.push(...(await refineBucket(countFn, b, countBucketUnits, 0, batchSize)));
+        buckets.push(...(await refineBucket(clipped, b, countBucketUnits, 0, batchSize)));
     }
-    return buildRequests(ids, parsed, window, interiorBoundaries(buckets, batchSize, window));
+    const packed = await splitBeforeUncuttable(clipped, buckets, window);
+    const boundaries = interiorBoundaries(packed, batchSize, window);
+    const totals = new Array(boundaries.length + 1).fill(0);
+    for (const b of packed) {
+        totals[boundaries.filter((cut) => cut <= b.start).length] += b.count;
+    }
+    const worst = Math.max(...totals);
+    if (worst > batchSize) {
+        return { overBudget: `a request would hold ${worst} rows, more than batchSize (${batchSize}) rows, ` +
+            "because no cut can be placed where they fall (a repeated daylight-saving hour)" };
+    }
+    return { requests: buildRequests(ids, parsed, window, boundaries) };
 }
 
 /**
  * Halve a request at its midpoint, written in the request's own form. A midpoint the form cannot
  * write unambiguously (a repeated DST hour) moves an hour later or earlier. Returns null when it
- * cannot be split (unplanned, or too short to halve).
+ * cannot be split (too short to halve).
  * @param {DeleteRequest} req The request the server rejected.
  * @returns {DeleteRequest[]|null} Two halves one level deeper, or null.
  */
@@ -588,6 +673,5 @@ module.exports = {
     buildCountQuery,
     parseCountResponse,
     planGroup,
-    unplannedRequest,
     splitRequest
 };

@@ -193,6 +193,10 @@ class FakeHistoryServer {
         if (badFilter !== null) {
             return { errors: [{ message: `Invalid filter: ${badFilter}` }] };
         }
+        // The planner must never ask for an empty or inverted range; fail loudly if it does.
+        if (!(fromMs < toMs)) {
+            return { errors: [{ message: `COUNT range start ${new Date(fromMs).toISOString()} is not before end ${new Date(toMs).toISOString()}` }] };
+        }
         const size = UNIT_MS[unit];
         const entity = ids.filter((id) => this.points.has(id)).map((id) => {
             const buckets = new Map();

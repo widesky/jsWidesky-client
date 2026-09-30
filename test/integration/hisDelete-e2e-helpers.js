@@ -147,23 +147,25 @@ function idsOfBody(body) {
 }
 
 /**
- * Max, over recorded delete request bodies and the ids in each, of the pre-delete SNAPSHOT rows
- * inside that request's resolved range. An id absent from snapshots or tzOf throws.
+ * For each recorded delete request body: its range, its ids, and the pre-delete SNAPSHOT rows
+ * inside that range summed over those ids (each id's range resolved in its own zone). An id
+ * absent from snapshots or tzOf throws.
  */
-function maxRowsPerRequest(bodies, snapshots, tzOf, nowMs) {
-    let max = 0;
-    for (const body of bodies) {
+function rowsPerRequest(bodies, snapshots, tzOf, nowMs) {
+    return bodies.map((body) => {
         const row = (body && body.rows && body.rows[0]) || {};
-        for (const id of idsOfBody(body)) {
+        const ids = idsOfBody(body);
+        let rows = 0;
+        for (const id of ids) {
             if (!snapshots[id] || !tzOf[id]) throw new Error(`delete request names unknown id ${id}`);
             const { fromMs, toMs } = resolveRange(row.range, tzOf[id], nowMs);
-            max = Math.max(max, countIn(snapshots[id], fromMs, toMs));
+            rows += countIn(snapshots[id], fromMs, toMs);
         }
-    }
-    return max;
+        return { range: row.range, ids, rows };
+    });
 }
 
 module.exports = {
     MIN, HOUR, DAY, SERVER_ROW_LIMIT, hsTzToIana, isNowDependent, resolveRange, every, uniqSorted,
-    countIn, shapesRegular, buildTzlessData, buildYesterdayData, idsOfBody, maxRowsPerRequest,
+    countIn, shapesRegular, buildTzlessData, buildYesterdayData, idsOfBody, rowsPerRequest,
 };

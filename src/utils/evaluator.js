@@ -7,7 +7,8 @@ const HIS_WRITE_BATCH_SIZE  = 10000;
 const HIS_WRITE_BATCH_SIZE_MAX = 20000;
 const HIS_WRITE_ENTITY_BATCH_SIZE = 100;
 const HIS_WRITE_ENTITY_BATCH_SIZE_MAX = 1000;
-// 500 leaves margin under the API server's 1500 rows-per-entity reject threshold.
+// Total rows per request, summed over its points. 500 keeps every request well under the API
+// server's 1500 rows-per-entity reject threshold.
 const HIS_DELETE_DATA_POINT_BATCH_SIZE = 500;
 const HIS_DELETE_DATA_POINT_BATCH_SIZE_MAX = 3000;
 const HIS_DELETE_ENTITY_BATCH_SIZE = 10;

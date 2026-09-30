@@ -81,7 +81,8 @@ describe("client.batch.hisDeleteByFilter", () => {
         it("uses a single request when the data fits the budget", async () => {
             const ids = genEntities(2);
             const fake = withPoints(ids, 12);
-            await ws.batch.hisDeleteByFilter("point", TIME_START, TIME_END, {batchSize: 15});
+            // 2 points x 12 rows: 24 in total, exactly the budget.
+            await ws.batch.hisDeleteByFilter("point", TIME_START, TIME_END, {batchSize: 24});
             expect(deletes(fake).map((r) => r.range)).to.eql([RANGE]);
         });
     });
