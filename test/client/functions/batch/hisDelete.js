@@ -2,7 +2,7 @@
 
 const expect = require("chai").expect;
 const stubs = require("../../../stubs");
-const { FakeHistoryServer, haystackError } = require("./fakeHistoryServer");
+const { FakeHistoryServer, haystackError, networkError } = require("./fakeHistoryServer");
 
 // Realistic point ids for a plant-room site.
 const PT = {
@@ -244,6 +244,133 @@ describe("client.batch.hisDelete", () => {
             expect(counts(fake)).to.eql([]);
             expect(deletes(fake).map((r) => r.range)).to.eql(["s:yesterday"]);
             expect(fake.rows(id)).to.eql([yStart - 1]);
+        });
+    });
+
+    describe("failures", () => {
+        const id = PT.chwFlowTemp;
+        const day = () => ({ [id]: { rows: every("2026-09-01T00:00:00Z", 1440, MIN) } });
+        const isDelete = (r) => r.uri === "/api/hisDelete";
+
+        it("retries a 503 and a reset connection, then succeeds", async () => {
+            for (const makeError of [() => haystackError(503, "Service Unavailable"), () => networkError("ECONNRESET")]) {
+                const { ws, fake } = client(day());
+                fake.failNext(isDelete, makeError);
+                const res = await ws.batch.hisDelete([id], RANGE, { retries: 2, retryDelay: 0 });
+                expect(res.errors).to.eql([]);
+                expect(fake.rows(id)).to.eql([]);
+            }
+        });
+
+        it("does not retry by default", async () => {
+            const { ws, fake } = client(day());
+            fake.failNext(isDelete, () => haystackError(503, "Service Unavailable"));
+            const res = await ws.batch.hisDelete([id], RANGE);
+            expect(res.errors).to.have.length(1);
+            expect(res.errors[0].args[0]).to.equal("hisDelete");
+        });
+
+        it("does not retry a 400 or a 429", async () => {
+            for (const status of [400, 429]) {
+                // Ten rows: the plan is exactly one request, so any retry shows as a second attempt.
+                const { ws, fake } = client({ [id]: { rows: every("2026-09-01T00:00:00Z", 10, MIN) } });
+                fake.failNext(isDelete, () => haystackError(status, "Rejected"), 5);
+                const res = await ws.batch.hisDelete([id], RANGE, { retries: 3, retryDelay: 0 });
+                expect(fake.requests.filter(isDelete), `status ${status}`).to.have.length(1);
+                expect(res.errors).to.have.length(1);
+            }
+        });
+
+        it("bisects instead of retrying when a retryable status carries the record-limit text", async () => {
+            // Ten rows: the plan is one request. A 503 whose body is the record-limit message is a
+            // size problem, so a retry of the same request cannot help; it is halved (1 + 2 requests).
+            const { ws, fake } = client({ [id]: { rows: every("2026-09-01T00:00:00Z", 10, MIN) } });
+            fake.failNext(isDelete, () => haystackError(503, "data points per entity cannot exceed 100"));
+            const res = await ws.batch.hisDelete([id], RANGE, { retries: 2, retryDelay: 0 });
+            expect(res.errors).to.eql([]);
+            expect(fake.requests.filter(isDelete)).to.have.length(3);
+            expect(fake.rows(id)).to.eql([]);
+        });
+
+        it("bisects a request rejected for the record limit and keeps the other results", async () => {
+            // Plan against 1500 rows; 400 more arrive after planning, so the one request is too big.
+            const { ws, fake } = client({ [id]: { rows: every("2026-09-01T00:00:00Z", 1500, MIN) } }, { recordLimit: 1500 });
+            fake.beforeFirstDelete((server) => {
+                server.points.get(id).rows.push(...every("2026-09-02T02:00:00Z", 400, MIN));
+                server.points.get(id).rows.sort((a, b) => a - b);
+            });
+            const res = await ws.batch.hisDelete([id], RANGE, { batchSize: 1500, returnResult: true });
+            expect(res.errors).to.eql([]);
+            expect(fake.rows(id)).to.eql([]);
+            expect(res.success.reduce((n, g) => n + g.rows.length, 0)).to.equal(1900);
+        });
+
+        it("reports the request instead of bisecting when maxBisectDepth is 0", async () => {
+            // Planned at up to 1500 rows per request against a server that rejects over 100.
+            const { ws, fake } = client({ [id]: { rows: every("2026-09-01T00:00:00Z", 2000, 1000) } }, { recordLimit: 100 });
+            const res = await ws.batch.hisDelete([id], RANGE, { batchSize: 1500, maxBisectDepth: 0 });
+            const attempts = fake.requests.filter(isDelete);
+            expect(attempts.length).to.be.greaterThan(0);
+            expect(res.errors).to.have.length(attempts.length);      // one error per planned request, none halved
+            for (const e of res.errors) {
+                expect(e.error).to.include("data points per entity cannot exceed");
+                expect(e.args[0]).to.equal("hisDelete");
+            }
+            expect(fake.rows(id)).to.have.length(2000);
+        });
+
+        it("stops halving at maxBisectDepth", async () => {
+            // The server rejects any request holding a row. Ten rows in the first ten minutes keep
+            // landing in the earlier half, so each level retries one failing half and one empty
+            // half: 1 + 2 + 2 attempts, and the depth cap leaves one reported failure.
+            const { ws, fake } = client({ [id]: { rows: every("2026-09-01T00:00:00Z", 10, MIN) } }, { recordLimit: 0 });
+            const res = await ws.batch.hisDelete([id], RANGE, { maxBisectDepth: 2 });
+            expect(fake.requests.filter(isDelete)).to.have.length(5);
+            expect(res.errors).to.have.length(1);
+            expect(fake.rows(id)).to.have.length(10);
+        });
+
+        it("skips only the group whose count query fails", async () => {
+            const ids = Array.from({ length: 12 }, (_, i) => `7a1d3c55-0b2e-4f6a-8c9d-10000000${String(i).padStart(4, "0")}`);
+            const points = Object.fromEntries(ids.map((x) => [x, { rows: every("2026-09-01T00:00:00Z", 24, HOUR) }]));
+            const { ws, fake } = client(points);
+            fake.failNext((r) => r.uri === "/graphql" && r.ids.includes(ids[11]), () => haystackError(500, "Count failed"));
+            const res = await ws.batch.hisDelete(ids, RANGE);
+            expect(res.errors.map((e) => e.args[0])).to.eql(["countQuery"]);
+            expect(res.errors[0].args[1]).to.eql(ids.slice(10));
+            for (const x of ids.slice(0, 10)) expect(fake.rows(x)).to.eql([]);
+            for (const x of ids.slice(10)) expect(fake.rows(x)).to.have.length(24);
+        });
+
+        it("skips only the group whose timezone read fails and carries on with the others", async () => {
+            // Offset-less range: each group is read for its tz first. A failed read is treated like a
+            // failed count for that group alone.
+            const ids = Array.from({ length: 12 }, (_, i) => `8b2e4d66-1c3f-4a7b-9d0e-20000000${String(i).padStart(4, "0")}`);
+            const points = Object.fromEntries(ids.map((x) => [x, { tz: "Brisbane", rows: every("2026-09-01T00:00:00+10:00", 24, HOUR) }]));
+            const { ws, fake } = client(points);
+            const range = "2026-09-01,2026-09-03";
+            fake.failNext((r) => r.uri === "/api/read" && r.ids.includes(ids[11]), () => haystackError(500, "Read failed"));
+            const res = await ws.batch.hisDelete(ids, range);
+            expect(res.errors).to.eql([{ error: "Read failed", args: ["countQuery", ids.slice(10), range] }]);
+            for (const x of ids.slice(0, 10)) expect(fake.rows(x), x).to.eql([]);
+            for (const x of ids.slice(10)) expect(fake.rows(x), x).to.have.length(24);
+        });
+
+        it("treats a GraphQL error body as a failed count", async () => {
+            const { ws, fake } = client(day());
+            const original = fake.count.bind(fake);
+            fake.count = () => ({ errors: [{ message: "Cannot query data by group" }] });
+            const res = await ws.batch.hisDelete([id], RANGE);
+            fake.count = original;
+            expect(res.errors).to.eql([{ error: "Cannot query data by group", args: ["countQuery", [id], RANGE] }]);
+            expect(fake.rows(id)).to.have.length(1440);
+        });
+
+        it("runs requests in parallel without losing any", async () => {
+            const { ws, fake } = client({ [id]: { rows: every("2026-09-01T00:00:00Z", 3 * 1440, MIN) } });
+            const res = await ws.batch.hisDelete([id], RANGE, { parallel: 3 });
+            expect(res.errors).to.eql([]);
+            expect(fake.rows(id)).to.eql([]);
         });
     });
 });
