@@ -130,6 +130,23 @@ describe("client.batch.hisDeleteByFilter", () => {
         });
     });
 
+    describe("arguments", () => {
+        it("accepts only Date start and end, as before the planner", async () => {
+            const fake = withPoints(genEntities(1), 5);
+            for (const [start, end] of [[RANGE, TIME_END], [TIME_START, "2026-09-02"], ["2026-09-01", "2026-09-02"]]) {
+                let thrown;
+                try {
+                    await ws.batch.hisDeleteByFilter("point", start, end);
+                } catch (error) {
+                    thrown = error;
+                }
+                expect(thrown && thrown.message, String(start)).to.equal("parameter timeStart or timeEnd is not of type Date");
+            }
+            expect(fake.requests).to.eql([]);
+            expect(fake.rows(genEntities(1)[0])).to.have.length(5);
+        });
+    });
+
     describe("error handling", () => {
         it("returns a failed delete with the ids and range that failed", async () => {
             const ids = genEntities(5);

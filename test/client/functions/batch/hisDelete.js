@@ -150,6 +150,21 @@ describe("client.batch.hisDelete", () => {
         const deletedRows = res.success.reduce((n, grid) => n + grid.rows.length, 0);
         expect(deletedRows).to.equal(1440);
     });
+    it("rejects a range that is neither a string nor two Dates", async () => {
+        const { ws, fake } = client({ [PT.chwFlowTemp]: { rows: every("2026-09-01T00:00:00Z", 10, MIN) } });
+        for (const args of [[new Date(START)], [new Date(START), "2026-09-04"], [START, END]]) {
+            let thrown;
+            try {
+                await ws.batch.hisDelete([PT.chwFlowTemp], ...args);
+            } catch (error) {
+                thrown = error;
+            }
+            expect(thrown && thrown.message).to.equal(
+                "range must be a Haystack range string, or timeStart and timeEnd must both be Date objects");
+        }
+        expect(fake.requests).to.eql([]);
+    });
+
     it("treats a null option as absent, so the configured retries still apply", async () => {
         const { ws, fake } = client(
             { [PT.chwFlowTemp]: { rows: every("2026-09-01T00:00:00Z", 60, MIN) } },

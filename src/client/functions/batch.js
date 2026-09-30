@@ -705,14 +705,18 @@ async function updateByFilter(filter, criteriaList, options={}) {
  * @param filter Filter to select the entities to be hisDelete'd.
  * @param start Starting timestamp to be deleted as a Date Object.
  * @param end Ending timestamp to be deleted as a Date Object (not inclusive).
- * @param options An Object defining batch configurations to be used. See README.md for more information.
- *                Option batchSize is determined by the maximum number of time series rows to be deleted across
- *                all ids given.
+ * @param options Options for batch.hisDelete plus `limit` (see docs/client/batch.md). Options not given
+ *                come from client config batch.hisDeleteByFilter, then its defaults; batch.hisDelete client
+ *                config does not apply on this path. batchSize bounds the rows per entity per request.
  * @returns {Promise<{success: Array, errors: Array<{errors: String, args: Array}>}>}
  *          - success: Return the result of each successful hisDelete operation when options.returnResult is true.
  *          - errors: Return any errors encountered when performing hisDelete operations.
  */
 async function hisDeleteByFilter(filter, start, end, options={}) {
+    // Only Dates, as before the planner: a range string belongs to batch.hisDelete.
+    if (!(start instanceof Date) || !(end instanceof Date)) {
+        throw new Error("parameter timeStart or timeEnd is not of type Date");
+    }
     await BATCH_HIS_DELETE_BY_FILTER_SCHEMA.validate(options);
     options = deriveFromDefaults(this.clientOptions.batch.hisDeleteByFilter, options);
     const { limit } = options;
