@@ -394,6 +394,84 @@ describe("client.batch.hisDelete", () => {
         });
     });
 
+    describe("ranges in part-hour zones that are left unsplit", () => {
+        // The server misreads a "+hh:mm" offset with minutes by (minutes x 59) minutes, so cuts
+        // written in a part-hour zone's real offset would land far from where they are meant.
+        // These are sent as one request, the caller's range verbatim, and the server decides.
+        const ADL = "ad1e2c3d-0000-4a5b-8c9d-0000000000ad";
+        const LHI = "10e0a1b2-0000-4a5b-8c9d-0000000010e0";
+        const BNE = "b0e1a2c3-0000-4a5b-8c9d-0000000000b0";
+        const minuteRows = (fromMs, days) => Array.from({ length: days * 1440 }, (_, i) => fromMs + i * MIN);
+
+        it("sends a +10:00 Adelaide named range as one verbatim request", async () => {
+            const range = "2026-06-01T00:00:00+10:00 Adelaide,2026-06-04T00:00:00+10:00 Adelaide";
+            const from = t("2026-06-01T00:00:00+10:00"), to = t("2026-06-04T00:00:00+10:00");
+            const rows = minuteRows(from - 2 * DAY, 7);
+            const { ws, fake } = client({ [ADL]: { tz: "Adelaide", rows } }, { recordLimit: 100000 });
+            const res = await ws.batch.hisDelete([ADL], range);
+            expect(res.errors).to.eql([]);
+            expect(counts(fake)).to.eql([]);
+            expect(deletes(fake).map((r) => r.range)).to.eql([`s:${range}`]);
+            // Whatever the one request deletes is what the fake says it deletes: the caller's
+            // whole range, and no rows before it.
+            expect(fake.rows(ADL)).to.eql(rows.filter((ms) => ms < from || ms >= to));
+        });
+
+        it("sends a date-only range containing Lord_Howe's 30-minute DST change as one verbatim request", async () => {
+            // Lord_Howe springs forward 2026-10-04 02:00 (+10:30 -> +11:00).
+            const from = moment.tz("2026-10-03", "Australia/Lord_Howe").valueOf();
+            const to = moment.tz("2026-10-06", "Australia/Lord_Howe").valueOf();
+            const rows = minuteRows(from - DAY, 5);
+            const { ws, fake } = client({ [LHI]: { tz: "Lord_Howe", rows } }, { recordLimit: 100000 });
+            const res = await ws.batch.hisDelete([LHI], "2026-10-03,2026-10-05");
+            expect(res.errors).to.eql([]);
+            expect(counts(fake)).to.eql([]);
+            expect(deletes(fake).map((r) => r.range)).to.eql(["s:2026-10-03,2026-10-05"]);
+            expect(fake.rows(LHI)).to.eql(rows.filter((ms) => ms < from || ms >= to));
+        });
+
+        it("sends a Lord_Howe named range containing its April DST change as one verbatim request", async () => {
+            // DST ends 2026-04-05 02:00 local (+11:00 -> +10:30).
+            const range = "2026-04-04T00:00:00+11:00 Lord_Howe,2026-04-07T00:00:00+11:00 Lord_Howe";
+            const rows = minuteRows(t("2026-04-03T00:00:00+11:00"), 5);
+            const { ws, fake } = client({ [LHI]: { tz: "Lord_Howe", rows } }, { recordLimit: 100000 });
+            await ws.batch.hisDelete([LHI], range);
+            expect(counts(fake)).to.eql([]);
+            expect(deletes(fake).map((r) => r.range)).to.eql([`s:${range}`]);
+        });
+
+        it("still plans a Lord_Howe date-only range with no DST change, in wall-time tokens", async () => {
+            const from = moment.tz("2026-09-01", "Australia/Lord_Howe").valueOf();
+            const to = moment.tz("2026-09-04", "Australia/Lord_Howe").valueOf();
+            const rows = [from - 1, to, ...minuteRows(from, 3)];
+            const { ws, fake } = client({ [LHI]: { tz: "Lord_Howe", rows } });
+            const res = await ws.batch.hisDelete([LHI], "2026-09-01,2026-09-03");
+            expect(res.errors).to.eql([]);
+            expect(fake.rows(LHI)).to.eql([from - 1, to]);
+            const sent = deletes(fake);
+            expect(sent.length).to.be.greaterThan(1);
+            for (const r of sent) {
+                for (const tok of ends(r)) expect(tok, tok).to.match(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}\+00:00 Lord_Howe$/);
+            }
+        });
+
+        for (const range of [
+            "2026-06-01T00:00:00+10:00 Brisbane,2026-06-04T00:00:00+10:00 Brisbane",
+            "2026-06-01,2026-06-03"
+        ]) {
+            it(`keeps writing Brisbane splits of ${range} with the real +10:00 offset`, async () => {
+                const rows = minuteRows(t("2026-06-01T00:00:00+10:00"), 3);
+                const { ws, fake } = client({ [BNE]: { tz: "Brisbane", rows } });
+                await ws.batch.hisDelete([BNE], range);
+                const sent = deletes(fake);
+                expect(sent.length).to.be.greaterThan(1);
+                for (const r of sent) {
+                    for (const tok of ends(r)) expect(tok, tok).to.match(/\+10:00 Brisbane$/);
+                }
+            });
+        }
+    });
+
     describe("ranges the planner does not split", () => {
         // Each is sent verbatim, one request per group, and the server decides. The fake rejects
         // them exactly as the API server's HDateTimeRange.make does, so the error is reported.

@@ -94,6 +94,29 @@ function hasPartHourOffset(zone, startMs, endMs) {
     return at.some((ms) => zone.utcOffset(ms) % 60 !== 0);
 }
 
+// True when a UTC-offset change inside (startMs, endMs) is not a whole number of hours (Lord_Howe's
+// 30-minute DST). The server's wall-time and offset arithmetic cannot place a cut around one.
+function hasSubHourTransition(zone, startMs, endMs) {
+    return zone.untils
+        .filter((u) => u > startMs && u < endMs)
+        .some((u) => (zone.utcOffset(u) - zone.utcOffset(u - 1)) % 60 !== 0);
+}
+
+/**
+ * Why a window in `iana` cannot be cut (rule d: one request, the caller's range verbatim), or null.
+ * `named` callers write real offsets, which the server misreads whenever they carry minutes.
+ */
+function unsplittableReason(iana, startMs, endMs, named) {
+    const zone = moment.tz.zone(iana);
+    if (hasSubHourTransition(zone, startMs, endMs)) {
+        return `${iana} has a UTC-offset change that is not a whole number of hours in the range`;
+    }
+    if (named && hasPartHourOffset(zone, startMs, endMs)) {
+        return `${iana} has a part-hour UTC offset in the range, which the server misreads in a cut`;
+    }
+    return null;
+}
+
 function parseEnd(token) {
     const tok = token.trim();
     if (DATE_ONLY_RE.test(tok)) {
@@ -154,7 +177,8 @@ function parseRange(range) {
 /**
  * The window a (sub-)group is planned over, and how its request ends are written. `zone` is the
  * sub-group's {iana, hsTz} for a "date" range, ignored otherwise. Returns null for a "date" range
- * whose sub-group has no mappable timezone (rule: send the caller's range verbatim).
+ * whose sub-group has no mappable timezone. A window that cannot be cut at all returns
+ * `{ unsplittable: <reason> }` (rule d: send the caller's range verbatim, one request).
  *   startMs/endMs      the true instants of the range, used for the COUNT histogram and to place
  *                      boundaries (for a "date" range, the local midnights the server gives the
  *                      dates in the point's timezone);
@@ -165,30 +189,37 @@ function parseRange(range) {
  * A "date" window is written with the real offset in a whole-hour zone (realOffsetForm), or as
  * local wall time + "+00:00 <Name>" in a zone with a part-hour offset anywhere in the window
  * (wallTimeForm), because the server misreads "+09:30". A "date" window whose own ends are not
- * cuttable also returns null. A "named" caller range keeps the caller's offset form: for a
- * part-hour offset the server misreads the caller's ends and the cuts alike, so the plan covers
- * what one verbatim request would.
+ * cuttable also returns null. A "named" caller range keeps the caller's offset form, but only in
+ * a zone with no part-hour offset in the window: cuts written "+09:30 Adelaide" would be misread
+ * by the server (~29.5 h), even when the caller wrote a whole-hour offset. Those, and any window
+ * containing a sub-hour offset transition (date or named), are left unsplit.
  */
 function windowFor(parsed, zone) {
     if (parsed.form === "utc") {
         return { startMs: parsed.start.ms, endMs: parsed.end.ms, startTok: parsed.start.tok, endTok: parsed.end.tok, ...UTC_FORM };
     }
     if (parsed.form === "named") {
+        const reason = unsplittableReason(parsed.iana, parsed.start.ms, parsed.end.ms, true);
+        if (reason) return { unsplittable: reason };
         return {
             startMs: parsed.start.ms, endMs: parsed.end.ms, startTok: parsed.start.tok, endTok: parsed.end.tok,
             ...realOffsetForm(parsed.iana, parsed.start.tzName)
         };
     }
-    if (!zone || !zone.iana) return null;
+    if (!zone || !zone.iana) return { unsplittable: `no usable timezone (${zone && zone.hsTz})` };
     // The instants the server gives the dates (HDate.midnight(start) and HDate.midnight(end + 1
     // day), read as local wall time in the point's timezone). Counting and packing use them.
     const startMs = moment.tz(parsed.start.iso, "YYYY-MM-DD", zone.iana).valueOf();
     const endMs = moment.tz(parsed.end.iso, "YYYY-MM-DD", zone.iana).add(1, "day").valueOf();
+    const reason = unsplittableReason(zone.iana, startMs, endMs, false);
+    if (reason) return { unsplittable: reason };
     // The tokens must be read back as those instants: whole-hour zones keep the real offset;
     // zones with a part-hour offset anywhere in the window use wall time (see wallTimeForm).
     const form = hasPartHourOffset(moment.tz.zone(zone.iana), startMs, endMs)
         ? wallTimeForm(zone.iana, zone.hsTz) : realOffsetForm(zone.iana, zone.hsTz);
-    if (!form.cuttable(startMs) || !form.cuttable(endMs)) return null;
+    if (!form.cuttable(startMs) || !form.cuttable(endMs)) {
+        return { unsplittable: `a range end falls in a repeated DST hour in ${zone.iana}` };
+    }
     return { startMs, endMs, startTok: form.format(startMs), endTok: form.format(endMs), ...form };
 }
 

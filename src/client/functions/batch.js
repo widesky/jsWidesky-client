@@ -425,8 +425,9 @@ function chunkIds(ids, size) {
  *     hisDeletePlan.wallTimeForm).
  * Any other range (relative keywords, mixed forms, a missing offset, seconds or tz name, two tz
  * names, "Z <Name>" for a zone other than UTC, "+00:00 <Name>" while that zone is not at UTC+0),
- * and a date-only range on a point with no usable tz, is sent verbatim as one request per group
- * for the server to accept or reject.
+ * a date-only range on a point with no usable tz, a named range in a zone with a part-hour
+ * offset, and a date or named range containing a sub-hour DST change, is sent verbatim as one
+ * request per group for the server to accept or reject.
  *
  * @param ids Point ids (array or single id).
  * @param range Haystack range string (with or without "s:"), or a Date for the start.
@@ -487,9 +488,9 @@ async function hisDelete(ids, range, endOrOptions, maybeOptions) {
         }
         for (const sub of subGroups) {
             const window = windowFor(parsed, sub);
-            if (!window) {
-                this.logger.warn("batch.hisDelete: no usable tz (%s) on %s; sending %s as one unplanned request",
-                    sub.hsTz, sub.ids.join(","), range);
+            if (window.unsplittable) {
+                this.logger.warn("batch.hisDelete: %s for %s; sending %s as one unplanned request",
+                    window.unsplittable, sub.ids.join(","), range);
                 requests.push(unplannedRequest(sub.ids, parsed.raw));
                 continue;
             }

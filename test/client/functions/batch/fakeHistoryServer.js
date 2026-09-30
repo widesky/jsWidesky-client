@@ -44,6 +44,11 @@ function networkError(code) {
  *     so "+10:00" is right but "+09:30" is read as +39:00;
  *   - a zero offset ("Z" or "+00:00") is not applied at all: the wall time is read in the named
  *     zone ("Z" alone and "... UTC" are UTC).
+ *
+ * KNOWN DIVERGENCE: a zero-offset wall time that is ambiguous (a repeated DST hour) or missing
+ * (a DST gap) is resolved here by client moment-timezone, which picks the earlier instant. The
+ * real server picks the later instant and depends on "now". The planner never emits such tokens
+ * (cuttable() refuses them), so the fake does not model that behaviour.
  */
 function parseEnd(token) {
     const tok = token.trim();
