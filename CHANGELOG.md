@@ -12,7 +12,7 @@ This project adheres to [Semantic Versioning](http://semver.org/).
   - Default request size lowered to 500 rows per point and 10 points per request (was 1500 / 100).
   - Requests rejected for the per-point record limit are halved and retried, up to `maxBisectDepth` times.
   - A range split into several requests keeps one form the server accepts; a date range is split in each point's timezone.
-  - Ranges it cannot split safely (relative, mixed forms, points without a timezone) are sent unchanged as one request.
+  - Ranges it cannot split safely (relative, mixed forms, no seconds, `Z`/`+00:00` with a non-UTC zone name, points without a timezone) are sent unchanged as one request.
   - `batch.hisDeleteByFilter` uses the same planner, new defaults (500 / 10) and the new options.
 
 ## [3.5.0] - 2026-08-13

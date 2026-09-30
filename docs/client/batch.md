@@ -100,14 +100,18 @@ Ids are split into groups of `batchSizeEntity`, in the order given, and each gro
 is planned (its row counts requested) before any delete is sent.
 
 1. Only three range forms are planned, because every request of a split plan must use one form the server accepts:
-   - two datetimes ending in `Z`, e.g. `2026-06-01T00:00:00Z,2026-06-04T00:00:00Z`;
+   - two datetimes ending in `Z` (or `Z UTC`), e.g. `2026-06-01T00:00:00Z,2026-06-04T00:00:00Z`;
    - two datetimes with an offset and the same timezone name, e.g.
      `2026-06-01T00:00:00+10:00 Brisbane,2026-06-04T00:00:00+10:00 Brisbane`;
    - two dates, e.g. `2026-06-01,2026-06-03`.
 
+   Datetimes must include seconds (`T00:00:00`, not `T00:00`), as the server requires.
+
    Any other range is not planned: relative ranges such as `today` or `yesterday`, a single value, a date paired with a
-   datetime, a datetime without an offset, an offset without a timezone name, two different timezone names, or a range
-   that cannot be parsed. It is sent exactly as given, as one request per group, whatever its length, and cannot be
+   datetime, a datetime without an offset or without seconds, an offset without a timezone name, two different timezone
+   names, or a range that cannot be parsed. Also not planned: `Z` followed by a timezone name other than `UTC`, and
+   `+00:00` followed by a timezone name where that timezone is not at UTC+0 at that time. The server reads both as
+   local time in the named timezone, not as UTC. It is sent exactly as given, as one request per group, whatever its length, and cannot be
    halved. The server accepts or rejects it; a rejection is reported in `errors` as a failed `hisDelete`.
 2. The server is asked for row counts over the range, in buckets of the first unit in `countBucketUnits`. A bucket
    counts as the highest row count of any entity in the group, since the server's limit applies per entity.
@@ -127,12 +131,22 @@ is planned (its row counts requested) before any delete is sent.
 8. A request halved after a record-limit rejection is cut in the same form as the rest of its plan.
 
 A date range is read by the server in each point's own timezone, so the client reads the group's points once and plans
-each timezone separately. When a split is needed, both ends become datetimes at local midnight in the point's timezone,
-followed by the point's timezone name: the start is midnight at the start of the first date and the end is midnight at
-the start of the day after the last date, e.g. `2026-06-01,2026-06-03` for a Brisbane point becomes
-`2026-06-01T00:00:00.000+10:00 Brisbane` to `2026-06-04T00:00:00.000+10:00 Brisbane`. These are the same instants the
-server uses for the dates. A point with no timezone, or one the client cannot map to a known timezone, is not planned:
-its range is sent exactly as given, as one request, and a warning is logged.
+each timezone separately. The server treats the dates as local midnight in the point's timezone: the start is midnight
+at the start of the first date and the end is midnight at the start of the day after the last date. The client plans
+over those same instants. When a split is needed, both ends and every cut are written as datetimes followed by the
+point's timezone name, in one of two forms:
+- For a timezone whose UTC offset is a whole number of hours, the datetime carries the real offset, e.g.
+  `2026-06-01,2026-06-03` for a Brisbane point becomes `2026-06-01T00:00:00.000+10:00 Brisbane` to
+  `2026-06-04T00:00:00.000+10:00 Brisbane`.
+- For a timezone whose offset has minutes at any time in the range (for example Adelaide, Darwin, Kolkata or
+  Kathmandu), the datetime is local time followed by `+00:00` and the name, e.g. `2026-06-01T00:00:00.000+00:00 Adelaide`
+  to `2026-06-04T00:00:00.000+00:00 Adelaide`. The server misreads the minutes of an offset such as `+09:30`, but reads
+  a `+00:00` offset with a timezone name as local time in that timezone, so this form deletes the intended rows. If the
+  server's handling of either changes, this form must change with it.
+
+No cut is placed in the hour that repeats when daylight saving ends, if the cut would be written with a `+00:00`
+offset, because that local time names two instants. A point with no timezone, or one the client cannot map to a known
+timezone, is not planned: its range is sent exactly as given, as one request, and a warning is logged.
 
 #### Failures and retries
 All planned requests are attempted. Failures do not stop the others; they are collected in `errors`, and requests that

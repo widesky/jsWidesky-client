@@ -419,10 +419,14 @@ function chunkIds(ids, size) {
  *   - both ends "...Z": boundaries are ISO "Z" instants, first/last keep the caller's tokens;
  *   - both ends "<offset> <TzName>" with the same name: boundaries in that zone with that name;
  *   - both ends dates: each group is read once and split by point timezone; both ends become
- *     local-midnight datetimes with the point's tz name (end = the day after the end date).
- * Any other range (relative keywords, mixed forms, a missing offset or tz name, two tz names), and
- * a date-only range on a point with no usable tz, is sent verbatim as one request per group for
- * the server to accept or reject.
+ *     local-midnight datetimes with the point's tz name (end = the day after the end date),
+ *     written with the real offset in a whole-hour zone, or as local wall time + "+00:00 <Name>"
+ *     in a zone with a part-hour offset in the window (the server misreads "+09:30"; see
+ *     hisDeletePlan.wallTimeForm).
+ * Any other range (relative keywords, mixed forms, a missing offset, seconds or tz name, two tz
+ * names, "Z <Name>" for a zone other than UTC, "+00:00 <Name>" while that zone is not at UTC+0),
+ * and a date-only range on a point with no usable tz, is sent verbatim as one request per group
+ * for the server to accept or reject.
  *
  * @param ids Point ids (array or single id).
  * @param range Haystack range string (with or without "s:"), or a Date for the start.

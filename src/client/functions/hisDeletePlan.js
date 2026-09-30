@@ -155,13 +155,19 @@ function parseRange(range) {
  * The window a (sub-)group is planned over, and how its request ends are written. `zone` is the
  * sub-group's {iana, hsTz} for a "date" range, ignored otherwise. Returns null for a "date" range
  * whose sub-group has no mappable timezone (rule: send the caller's range verbatim).
- *   startMs/endMs      the absolute range, used for the COUNT histogram and to place boundaries;
+ *   startMs/endMs      the true instants of the range, used for the COUNT histogram and to place
+ *                      boundaries (for a "date" range, the local midnights the server gives the
+ *                      dates in the point's timezone);
  *   startTok/endTok    the first request's start and the last request's end in a split plan;
  *   format(ms)         an interior boundary (and a bisection midpoint) in the same form;
  *   cuttable(ms)       whether format(ms) is read back by the server as exactly ms (false only
  *                      for a zero-offset token in the hour a DST change repeats).
- * A "date" window whose zone has a part-hour offset is written as local wall time + "+00:00
- * <Name>" (wallTimeForm); a "date" window whose own ends are not cuttable also returns null.
+ * A "date" window is written with the real offset in a whole-hour zone (realOffsetForm), or as
+ * local wall time + "+00:00 <Name>" in a zone with a part-hour offset anywhere in the window
+ * (wallTimeForm), because the server misreads "+09:30". A "date" window whose own ends are not
+ * cuttable also returns null. A "named" caller range keeps the caller's offset form: for a
+ * part-hour offset the server misreads the caller's ends and the cuts alike, so the plan covers
+ * what one verbatim request would.
  */
 function windowFor(parsed, zone) {
     if (parsed.form === "utc") {
