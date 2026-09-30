@@ -1,335 +1,158 @@
 /*
  * vim: set tw=78 et ts=4 sw=4 si fileencoding=utf-8:
  *
- * Unit tests for client CRUD methods
+ * Behavioural tests for client.batch.hisDeleteByFilter. The entity lookup (findAsId) is stubbed;
+ * history is an in-memory fake server, so tests assert on the rows left behind.
  */
 "use strict";
 
-const stubs = require('../../../stubs');
-const sinon = require('sinon');
+const stubs = require("../../../stubs");
+const sinon = require("sinon");
 const {RequestError} = require("../../../../src/errors");
-const expect = require('chai').expect;
+const expect = require("chai").expect;
+const {FakeHistoryServer, haystackError} = require("./fakeHistoryServer");
 const getInstance = stubs.getInstance;
-const Hs = require("../../../../src/utils/haystack");
 
-const HIS_DELETE_ENTITY_BATCH_SIZE = 100;
-const HIS_READ_LARGE_TIME_SERIES = {
-    data: require("./files/hisRead_timeseries_large.json"),
-    ids: [
-        '0824d6c3-ebde-420d-96a4-272afe842190',
-        '06037f10-bc06-4ddd-a58e-3fe2a975e830',
-        '01912a1b-65fd-4449-b4e9-e8dc48e3b148',
-        '0e2578db-90a3-4454-95d3-38565f26c0f6',
-        '0e201c40-05bc-11ee-8644-ab3fe7a960b1'
-    ]
-};
-const HIS_READ_SMALL_TIME_SERIES = {
-    data: require("./files/hisRead_small.json"),
-    ids: HIS_READ_LARGE_TIME_SERIES.ids
-};
-const HIS_READ_LARGE_ENTITIES = {
-    data: require("./files/hisRead_entities_large.json"),
-    ids: require("./files/hisRead_entites_ids.json")
-};
-const TIME_START = new Date(0);
-const TIME_END = new Date();
+const MIN = 60000;
+const START = Date.parse("2026-09-01T00:00:00Z");
+const END = Date.parse("2026-09-02T00:00:00Z");
+const TIME_START = new Date(START);
+const TIME_END = new Date(END);
+const RANGE = "s:2026-09-01T00:00:00.000Z,2026-09-02T00:00:00.000Z";
 
-function genEntities(source, num) {
-    const entities = [];
-    for (let i = 0; i < num; i++) {
-        entities.push(`id-${source[i]}`);
-    }
+const every = (count, stepMs) => Array.from({length: count}, (_, i) => START + i * stepMs);
+const deletes = (fake) => fake.requests.filter((r) => r.uri === "/api/hisDelete");
 
-    return entities;
+// Realistic point ids for a chiller plant.
+function genEntities(num) {
+    return Array.from({length: num}, (_, i) => `c0ffee00-1111-4a5b-8c9d-${String(i).padStart(12, "0")}`);
+}
+
+function pointsFor(ids, rowsPerPoint) {
+    return Object.fromEntries(ids.map((id) => [id, {rows: every(rowsPerPoint, MIN)}]));
 }
 
 describe("client.batch.hisDeleteByFilter", () => {
-    let ws, http, log;
+    let ws, log;
     beforeEach(() => {
-        http = new stubs.StubHTTPClient();
         log = new stubs.StubLogger();
-        ws = getInstance(http, log);
-        ws.findAsId = sinon.stub().callsFake(() => []);
-        ws.hisRead = sinon.stub().callsFake((ids, start, end, batchSize) =>  {
-            return {
-                rows: [
-                    {
-                        "ts": "t:1970-01-01T00:00:00.000Z",
-                        "v0": "n:0",
-                        "v1": "n:1",
-                        "v2": "n:2",
-                        "v3": "n:3",
-                        "v4": "n:4"
-                    },
-                ]
-            };
-        });
-        ws.hisDelete = sinon.stub().callsFake(() => ["test"]);
+        ws = getInstance(new stubs.StubHTTPClient(), log);
+        ws.findAsId = sinon.stub().resolves([]);
     });
 
+    function withPoints(ids, rowsPerPoint) {
+        ws.findAsId = sinon.stub().callsFake(() => [...ids]);
+        return new FakeHistoryServer({points: pointsFor(ids, rowsPerPoint)}).install(ws);
+    }
+
     describe("options not specified", () => {
-        describe("entity payload smaller than default batchSize", () => {
-            it("should create 1 request", async () => {
-                const entities = genEntities(
-                    HIS_READ_LARGE_ENTITIES.ids, HIS_DELETE_ENTITY_BATCH_SIZE - 4);
-                ws.findAsId = sinon.stub().callsFake(() => [...entities]);
-                ws.batch.hisRead = sinon.stub().callsFake(() => {
-                    return {
-                        success: HIS_READ_LARGE_ENTITIES.data,
-                        errors: []
-                    };
-                });
-                await ws.batch.hisDeleteByFilter("point", TIME_START, TIME_END);
-                expect(ws.findAsId.calledOnce).to.be.true;
-                expect(ws.hisDelete.calledOnce).to.be.true;
-                expect(ws.hisDelete.args[0]).to.eql([
-                    entities,
-                    "s:1970-01-01T00:00:00.000Z,1970-01-01T00:00:00.010Z"
-                ]);
-            });
+        it("deletes history for every entity the filter finds", async () => {
+            const ids = genEntities(2);
+            const fake = withPoints(ids, 60);
+            const res = await ws.batch.hisDeleteByFilter("point and his", TIME_START, TIME_END);
+            expect(res.errors).to.eql([]);
+            expect(ws.findAsId.calledOnce).to.be.true;
+            for (const id of ids) expect(fake.rows(id)).to.eql([]);
         });
 
-        describe("entity payload larger than default batchSize", () => {
-            it("should create more than 1 request", async () => {
-                const entities = genEntities(
-                    HIS_READ_LARGE_ENTITIES.ids, HIS_DELETE_ENTITY_BATCH_SIZE + 10);
-                ws.findAsId = sinon.stub().callsFake(() => [...entities]);
-                ws.batch.hisRead = sinon.stub().callsFake(() => {
-                    return {
-                        success: HIS_READ_LARGE_ENTITIES.data,
-                        errors: []
-                    };
-                });
-                await ws.batch.hisDeleteByFilter("point", TIME_START, TIME_END);
-                expect(ws.findAsId.calledOnce).to.be.true;
-                expect(ws.hisDelete.calledTwice).to.be.true;
-                expect(ws.hisDelete.args[0]).to.eql([
-                    entities.slice(0, HIS_DELETE_ENTITY_BATCH_SIZE),
-                    "s:1970-01-01T00:00:00.000Z,1970-01-01T00:00:00.010Z"
-                ]);
-                expect(ws.hisDelete.args[1]).to.eql([
-                    entities.slice(HIS_DELETE_ENTITY_BATCH_SIZE),
-                    "s:1970-01-01T00:00:00.000Z,1970-01-01T00:00:00.010Z"
-                ]);
-            });
+        it("splits more entities than the default entity batch across requests", async () => {
+            const ids = genEntities(25);
+            const fake = withPoints(ids, 30);
+            const res = await ws.batch.hisDeleteByFilter("point", TIME_START, TIME_END);
+            expect(res.errors).to.eql([]);
+            expect(Math.max(...deletes(fake).map((r) => r.ids.length))).to.be.at.most(10);
+            expect(deletes(fake).length).to.be.at.least(3);
+            for (const id of ids) expect(fake.rows(id)).to.eql([]);
         });
     });
 
     describe("option batchSize", () => {
-        describe("delete data smaller than batchSize", () => {
-            it("should make 1 request", async () => {
-                const entities = genEntities(
-                    HIS_READ_LARGE_ENTITIES.ids, 12);
-                ws.findAsId = sinon.stub().callsFake(() => [...entities]);
-                ws.batch.hisRead = sinon.stub().callsFake(() => HIS_READ_LARGE_ENTITIES.data.slice(0, 12));
-                ws.findAsId = sinon.stub().callsFake(() => [...entities]);
-                ws.batch.hisRead = sinon.stub().callsFake(() => {
-                    return {
-                        success: HIS_READ_LARGE_ENTITIES.data.slice(0, 12),
-                        errors: []
-                    };
-                });
-                await ws.batch.hisDeleteByFilter("point", TIME_START, TIME_END, {
-                    batchSize: 15
-                });
-                expect(ws.findAsId.calledOnce).to.be.true;
-                expect(ws.hisDelete.calledOnce).to.be.true;
-                expect(ws.hisDelete.args[0]).to.eql([
-                    entities,
-                    "s:1970-01-01T00:00:00.000Z,1970-01-01T00:00:00.010Z"
-                ]);
-            });
+        it("keeps each request within the row budget and still deletes everything", async () => {
+            const ids = genEntities(1);
+            const fake = withPoints(ids, 200);
+            const res = await ws.batch.hisDeleteByFilter("point", TIME_START, TIME_END, {batchSize: 50});
+            expect(res.errors).to.eql([]);
+            const sizes = deletes(fake).map((r) => r.deleted[0]);
+            expect(Math.max(...sizes)).to.be.at.most(50);
+            expect(sizes.length).to.be.at.least(4);
+            expect(fake.rows(ids[0])).to.eql([]);
         });
 
-        describe("delete data greater than batchSize", () => {
-            it("should make more than 1 request", async () => {
-                const entities = genEntities(
-                    HIS_READ_SMALL_TIME_SERIES.ids, 5);
-                ws.findAsId = sinon.stub().callsFake(() => [...entities]);
-                ws.batch.hisRead = sinon.stub().callsFake(() => {
-                    return {
-                        success: HIS_READ_SMALL_TIME_SERIES.data,
-                        errors: []
-                    };
-                });
-                await ws.batch.hisDeleteByFilter("point", TIME_START, TIME_END, {
-                    batchSize: 2
-                });
-                expect(ws.findAsId.calledOnce).to.be.true;
-                expect(ws.hisDelete.calledThrice).to.be.true;
-                expect(ws.hisDelete.args[0]).to.eql([
-                    entities,
-                    "s:1970-01-01T00:00:00.000Z,1970-01-01T00:00:00.002Z"
-                ]);
-                expect(ws.hisDelete.args[1]).to.eql([
-                    entities,
-                    "s:1970-01-01T00:00:00.002Z,1970-01-01T00:00:00.004Z"
-                ]);
-                expect(ws.hisDelete.args[2]).to.eql([
-                    entities,
-                    "s:1970-01-01T00:00:00.004Z,1970-01-01T00:00:00.005Z"
-                ]);
-            });
+        it("uses a single request when the data fits the budget", async () => {
+            const ids = genEntities(2);
+            const fake = withPoints(ids, 12);
+            await ws.batch.hisDeleteByFilter("point", TIME_START, TIME_END, {batchSize: 15});
+            expect(deletes(fake).map((r) => r.range)).to.eql([RANGE]);
         });
     });
 
     describe("option batchSizeEntity", () => {
-        describe("entities to delete data smaller than batchSizeEntity", () => {
-            it("should make 1 request", async () => {
-                const entities = genEntities(HIS_READ_SMALL_TIME_SERIES.ids, 5);
-                    ws.findAsId = sinon.stub().callsFake(() => [...entities]);
-                ws.batch.hisRead = sinon.stub().callsFake(() => {
-                    return {
-                        success: HIS_READ_SMALL_TIME_SERIES.data,
-                        errors: []
-                    };
-                });
-                await ws.batch.hisDeleteByFilter(
-                    "points", TIME_START, TIME_END, {
-                        batchSizeEntity: 10
-                    }
-                );
-                expect(ws.hisDelete.calledOnce).to.be.true;
-                expect(ws.hisDelete.args[0]).to.eql([
-                    entities, "s:1970-01-01T00:00:00.000Z,1970-01-01T00:00:00.005Z"
-                ]);
-            });
+        it("limits how many entities go into one request", async () => {
+            const ids = genEntities(5);
+            const fake = withPoints(ids, 5);
+            const res = await ws.batch.hisDeleteByFilter("points", TIME_START, TIME_END, {batchSizeEntity: 2});
+            expect(res.errors).to.eql([]);
+            expect(deletes(fake).map((r) => r.ids)).to.eql([ids.slice(0, 2), ids.slice(2, 4), ids.slice(4)]);
+            for (const id of ids) expect(fake.rows(id)).to.eql([]);
         });
 
-        describe("entities to delete data greater than batchSizeEntity", () => {
-            it("should make more than 1 request", async () => {
-                const entities = genEntities(HIS_READ_SMALL_TIME_SERIES.ids, 5);
-                ws.findAsId = sinon.stub().callsFake(() => [...entities]);
-                ws.batch.hisRead = sinon.stub().callsFake(() => {
-                    return {
-                        success: HIS_READ_SMALL_TIME_SERIES.data,
-                        errors: []
-                    };
-                });
-                await ws.batch.hisDeleteByFilter(
-                    "points", TIME_START, TIME_END, {
-                        batchSizeEntity: 2
-                    }
-                );
-                expect(ws.hisDelete.calledThrice).to.be.true;
-                expect(ws.hisDelete.args[0]).to.eql([
-                    entities.slice(0, 2),
-                    "s:1970-01-01T00:00:00.000Z,1970-01-01T00:00:00.005Z"
-                ]);
-                expect(ws.hisDelete.args[1]).to.eql([
-                    entities.slice(2, 4),
-                    "s:1970-01-01T00:00:00.000Z,1970-01-01T00:00:00.005Z"
-                ]);
-                expect(ws.hisDelete.args[2]).to.eql([
-                    entities.slice(4),
-                    "s:1970-01-01T00:00:00.000Z,1970-01-01T00:00:00.005Z"
-                ]);
-            });
+        it("uses one request when the entities fit", async () => {
+            const ids = genEntities(5);
+            const fake = withPoints(ids, 5);
+            await ws.batch.hisDeleteByFilter("points", TIME_START, TIME_END, {batchSizeEntity: 10});
+            expect(deletes(fake).map((r) => r.ids)).to.eql([ids]);
         });
     });
 
     describe("option limit", () => {
         it("should pass argument to client.findAsId", async () => {
-            const entities = genEntities(HIS_READ_SMALL_TIME_SERIES.ids, 5);
-            ws.findAsId = sinon.stub().callsFake(() => [...entities]);
-            ws.batch.hisRead = sinon.stub().callsFake(() => {
-                return {
-                    success: HIS_READ_SMALL_TIME_SERIES.data,
-                    errors: []
-                };
-            });
-            await ws.batch.hisDeleteByFilter("point", TIME_START, TIME_END, {
-                limit: 30
-            });
+            withPoints(genEntities(5), 5);
+            await ws.batch.hisDeleteByFilter("point", TIME_START, TIME_END, {limit: 30});
             expect(ws.findAsId.calledOnce).to.be.true;
-            expect(ws.findAsId.args[0]).to.eql(["point", 30])
+            expect(ws.findAsId.args[0]).to.eql(["point", 30]);
         });
     });
 
     describe("option returnResult", () => {
-        let entities;
-        beforeEach(() => {
-            ws.batch.hisRead = sinon.stub().callsFake(() => {
-                return {
-                    success: HIS_READ_SMALL_TIME_SERIES.data,
-                    errors: []
-                };
-            });
-            entities = genEntities(HIS_READ_SMALL_TIME_SERIES.ids, 5);
-            ws.findAsId = sinon.stub().callsFake(() => [...entities]);
+        it("returns each delete response if enabled", async () => {
+            withPoints(genEntities(5), 20);
+            const result = await ws.batch.hisDeleteByFilter("point", TIME_START, TIME_END, {returnResult: true});
+            expect(result.errors).to.eql([]);
+            expect(result.success.reduce((n, grid) => n + grid.rows.length, 0)).to.equal(5 * 20);
         });
 
-        describe("if enabled", () => {
-            it("should return the result", async () => {
-                const result = await ws.batch.hisDeleteByFilter(
-                    HIS_READ_SMALL_TIME_SERIES.ids, TIME_START, TIME_END, {
-                        returnResult: true
-                    }
-                );
-                expect(result).to.eql({
-                    success: [["test"]],
-                    errors: []
-                })
-            });
-        });
-
-        describe("if not enabled", () => {
-            it("should not return the result", async () => {
-                const result = await ws.batch.hisDeleteByFilter(
-                    HIS_READ_SMALL_TIME_SERIES.ids, TIME_START, TIME_END, {
-                        returnResult: false
-                    }
-                );
-                expect(result).to.eql({
-                    success: [],
-                    errors: []
-                })
-            });
+        it("returns no responses if not enabled", async () => {
+            const ids = genEntities(5);
+            const fake = withPoints(ids, 20);
+            const result = await ws.batch.hisDeleteByFilter("point", TIME_START, TIME_END, {returnResult: false});
+            expect(result).to.eql({success: [], errors: []});
+            for (const id of ids) expect(fake.rows(id)).to.eql([]);
         });
     });
 
     describe("error handling", () => {
-        let entities;
-        beforeEach(() => {
-            entities = genEntities(HIS_READ_SMALL_TIME_SERIES.ids, 5);
-            ws.findAsId = sinon.stub().callsFake(() => entities);
-            ws.batch.hisRead = sinon.stub().callsFake(() => {
-                return {
-                    success: HIS_READ_SMALL_TIME_SERIES.data,
-                    errors: []
-                };
-            });
-            ws.hisDelete = sinon.stub().callsFake(() => {
-                throw new Error("Test error");
-            });
+        it("returns a failed delete with the ids and range that failed", async () => {
+            const ids = genEntities(5);
+            const fake = withPoints(ids, 20);
+            fake.failNext((r) => r.uri === "/api/hisDelete", () => haystackError(400, "Test error"));
+            const {success, errors} = await ws.batch.hisDeleteByFilter("bad filter", TIME_START, TIME_END);
+            expect(success).to.eql([]);
+            expect(errors).to.have.length(1);
+            expect(errors[0].args).to.eql(["hisDelete", ids, RANGE]);
+            expect(errors[0].error).to.include("Test error");
+            // the failed request deleted nothing
+            for (const id of ids) expect(fake.rows(id)).to.have.length(20);
         });
 
-        it("should return encountered errors by hisDelete", async () => {
-            const result = await ws.batch.hisDeleteByFilter(
-                "bad filter", TIME_START, TIME_END);
-            expect(result.errors.length).to.equal(1);
-            expect(result.errors).to.eql([{
-                args: [
-                    "hisDelete",
-                    entities,
-                    "s:1970-01-01T00:00:00.000Z,1970-01-01T00:00:00.005Z"
-                ],
-                error: "Test error"
-            }]);
-        });
-    });
-
-    describe("error handling", () => {
-        let entities;
-        beforeEach(() => {
-            entities = genEntities(HIS_READ_SMALL_TIME_SERIES.ids, 5);
-            ws.findAsId = sinon.stub().callsFake(() => [...entities]);
-            ws.batch.hisRead = sinon.stub().callsFake(() => {
-                return {
-                    success: HIS_READ_SMALL_TIME_SERIES.data,
-                    errors: []
-                };
-            });
+        it("returns a failed count and deletes nothing for that group", async () => {
+            const ids = genEntities(5);
+            const fake = withPoints(ids, 20);
+            fake.failNext((r) => r.uri === "/graphql", () => haystackError(400, "Bad count"));
+            const {success, errors} = await ws.batch.hisDeleteByFilter("point", TIME_START, TIME_END);
+            expect(success).to.eql([]);
+            expect(errors).to.have.length(1);
+            expect(errors[0].args).to.eql(["countQuery", ids, RANGE]);
+            expect(deletes(fake)).to.eql([]);
         });
 
         it("should handle errors encountered by v2.filter and return them", async () => {
@@ -337,80 +160,33 @@ describe("client.batch.hisDeleteByFilter", () => {
                 const fakeError = new Error("test");
                 fakeError.response = {
                     data: {
-                        errors: [
-                            {
-                                "locations": [
-                                    {
-                                        "column": 3,
-                                        "line": 4
-                                    }
-                                ],
-                                "message": "Invalid name start char (end of stream)"
-                            }
-                        ]
+                        errors: [{
+                            "locations": [{"column": 3, "line": 4}],
+                            "message": "Invalid name start char (end of stream)"
+                        }]
                     }
-                }
+                };
                 throw RequestError.make(fakeError, log);
             });
 
-            const { success, errors } = await ws.batch.hisDeleteByFilter("bad filter", TIME_START, TIME_END);
+            const {success, errors} = await ws.batch.hisDeleteByFilter("bad filter", TIME_START, TIME_END);
             expect(success.length).to.equal(0);
-            expect(errors.length).to.equal(1);
-            expect(errors[0]).to.eql({
+            expect(errors).to.eql([{
                 error: "Invalid name start char (end of stream)",
                 args: ["findAsId", "bad filter", 0]
-            });
+            }]);
         });
 
-        it("should handle errors encountered by hisDelete and return them", async () => {
-            ws.hisDelete = sinon.stub().callsFake(() => {
-                throw new Error("Not well");
-            });
-
-            const { success, errors } = await ws.batch.hisDeleteByFilter("bad filter", TIME_START, TIME_END);
-            expect(success.length).to.equal(0);
-            expect(errors.length).to.equal(1);
-            expect(errors[0]).to.eql({
-                error: "Not well",
-                args: [
-                    "hisDelete",
-                    entities,
-                    "s:1970-01-01T00:00:00.000Z,1970-01-01T00:00:00.005Z"
-                ]
-            });
-        });
-
-        it("should return errors encountered by hisRead", async () => {
-            ws.batch.hisRead = sinon.stub().callsFake((...args) => {
-                return {
-                    success: [[], [], [], [], []],
-                    errors: [{
-                        error: "Bad hisRead",
-                        args: ["hisRead", ...args]
-                    }]
-                };
-            });
-            const result = await ws.batch.hisDeleteByFilter(
-                HIS_READ_SMALL_TIME_SERIES.ids, TIME_START, TIME_END);
-            expect(result.errors.length).to.equal(1);
-            expect(result.errors[0]).to.eql({
-                error: "Bad hisRead",
-                args: ["hisRead", entities, TIME_START, TIME_END]
-            });
-        });
-
-        it("should handle errors encountered by v2.filter and return them", async () => {
+        it("returns a findAsId failure and sends no requests", async () => {
+            const fake = new FakeHistoryServer({points: {}}).install(ws);
             ws.findAsId = sinon.stub().callsFake(() => {
                 throw new Error("Bad filter");
             });
 
-            const { success, errors } = await ws.batch.hisDeleteByFilter("bad filter", TIME_START, TIME_END);
+            const {success, errors} = await ws.batch.hisDeleteByFilter("bad filter", TIME_START, TIME_END);
             expect(success.length).to.equal(0);
-            expect(errors.length).to.equal(1);
-            expect(errors[0]).to.eql({
-                error: "Bad filter",
-                args: ["findAsId", "bad filter", 0]
-            });
+            expect(errors).to.eql([{error: "Bad filter", args: ["findAsId", "bad filter", 0]}]);
+            expect(fake.requests).to.eql([]);
         });
     });
 });
