@@ -94,11 +94,15 @@ function regularBuild(range, tz, only) {
     };
 }
 
+// Adelaide (+09:30) checks the planner's wall-time "+00:00 Adelaide" form against the real server:
+// its zero-offset reading and its tzMins*60 offset arithmetic are what that form relies on.
+const TZLESS_ZONES = ["Brisbane", "New_York", "Adelaide"];
+
 function tzlessBuild() {
-    const zoneOf = (i) => (i % 2 === 0 ? "Brisbane" : "New_York");
+    const zoneOf = (i) => TZLESS_ZONES[i % TZLESS_ZONES.length];
     return () => ({
         targets: Array.from({ length: 12 }, (_, i) => ({ name: `point_${i}`, tz: zoneOf(i), data: H.buildTzlessData(zoneOf(i)) })),
-        controls: [0, 1].map((i) => ({ name: `control_${i + 1}`, tz: zoneOf(i), data: H.buildTzlessData(zoneOf(i)) })),
+        controls: TZLESS_ZONES.map((zone, i) => ({ name: `control_${i + 1}`, tz: zone, data: H.buildTzlessData(zone) })),
     });
 }
 

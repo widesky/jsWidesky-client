@@ -47,6 +47,25 @@ describe("hisDelete e2e helpers", () => {
             expect(iso(H.resolveRange(range, "New_York"))).to.eql(["2026-06-01T04:00:00.000Z", "2026-06-02T16:30:00.000Z"]);
         });
 
+        it("reads a zero offset with a zone name as wall time in that zone, as the server does", () => {
+            // The planner writes Adelaide date-only splits in this form.
+            const range = "s:2026-06-01T00:00:00.000+00:00 Adelaide,2026-06-02T12:00:00.000+00:00 Adelaide";
+            expect(iso(H.resolveRange(range, "Adelaide"))).to.eql(["2026-05-31T14:30:00.000Z", "2026-06-02T02:30:00.000Z"]);
+            // Whatever the point's zone: the token's own name decides.
+            expect(iso(H.resolveRange(range, "Brisbane"))).to.eql(["2026-05-31T14:30:00.000Z", "2026-06-02T02:30:00.000Z"]);
+            expect(iso(H.resolveRange("2026-09-01T00:00:00Z London,2026-09-02T00:00:00Z London", "Brisbane")))
+                .to.eql(["2026-08-31T23:00:00.000Z", "2026-09-01T23:00:00.000Z"]);
+        });
+
+        it("applies a +09:30 offset as the server does (tzHours*60 + tzMins*60 minutes = +39:00)", () => {
+            const range = "2026-06-01T00:00:00.000+09:30 Adelaide,2026-06-02T00:00:00.000+09:30 Adelaide";
+            expect(iso(H.resolveRange(range, "Adelaide"))).to.eql(["2026-05-30T09:00:00.000Z", "2026-05-31T09:00:00.000Z"]);
+        });
+
+        it("tz-less date range resolves in Adelaide's local days", () => {
+            expect(iso(H.resolveRange("2026-06-01,2026-06-03", "Adelaide"))).to.eql(["2026-05-31T14:30:00.000Z", "2026-06-03T14:30:00.000Z"]);
+        });
+
         it("resolves yesterday and today from nowMs in Brisbane", () => {
             expect(iso(H.resolveRange("yesterday", "Brisbane", NOW))).to.eql(["2026-09-28T14:00:00.000Z", "2026-09-29T14:00:00.000Z"]);
             expect(iso(H.resolveRange("today", "Brisbane", NOW))).to.eql(["2026-09-29T14:00:00.000Z", "2026-09-30T14:00:00.000Z"]);
@@ -96,7 +115,7 @@ describe("hisDelete e2e helpers", () => {
             });
         }
 
-        for (const zone of ["Brisbane", "New_York"]) {
+        for (const zone of ["Brisbane", "New_York", "Adelaide"]) {
             it(`tz-less data for ${zone}: bounded, and bursts fill the first and last local hour`, () => {
                 const data = H.buildTzlessData(zone);
                 const { fromMs, toMs } = checkPoint(data, "2026-06-01,2026-06-03", zone, zone);

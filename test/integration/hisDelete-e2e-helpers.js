@@ -22,7 +22,7 @@ function hsTzToIana(hsTz) {
 }
 
 const DATE_ONLY = /^\d{4}-\d{2}-\d{2}$/;
-const ABSOLUTE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2}(\.\d+)?)?(Z|[+-]\d{2}:\d{2})$/;
+const ABSOLUTE = /^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?)(Z|[+-]\d{2}:\d{2})$/;
 
 /** Ranges whose meaning depends on the wall clock; only these need the midnight guard. */
 function isNowDependent(range) {
@@ -30,14 +30,36 @@ function isNowDependent(range) {
     return s === "today" || s === "yesterday";
 }
 
+/**
+ * One range end, as the API server resolves it (widesky-api-server HZincReader + read.js ->
+ * timezoneSvc.timezoneEpoch), which is NOT ISO 8601 for two cases:
+ *   - a non-zero offset is applied as tzHours*60 + tzMins*60 minutes, so "+09:30" reads as +39:00;
+ *   - a zero offset ("Z" / "+00:00") followed by a zone name other than UTC is not applied: the
+ *     wall time is read in that named zone.
+ * A datetime with no offset is read in the point's zone (`iana`).
+ */
 function resolveToken(rawToken, isEnd, iana, range) {
-    const token = rawToken.trim().split(" ")[0];
+    const [token, name] = rawToken.trim().split(" ");
     if (DATE_ONLY.test(token)) {
         // Date-only: local midnight in the point's zone; an END covers that whole local day.
         const m = moment.tz(token, "YYYY-MM-DD", iana);
         return (isEnd ? m.add(1, "day") : m).valueOf();
     }
-    if (ABSOLUTE.test(token)) return Date.parse(token);
+    const abs = token.match(ABSOLUTE);
+    if (abs) {
+        const [, wall, offset] = abs;
+        const wallUtc = moment.utc(wall, moment.ISO_8601, true);
+        if (!wallUtc.isValid()) throw new Error(`Unhandled range token "${token}" in "${range}"`);
+        if (offset === "Z" || /^[+-]00:00$/.test(offset)) {
+            if (!name || name === "UTC") return wallUtc.valueOf();
+            const zone = hsTzToIana(name);
+            if (!zone) throw new Error(`Unknown Haystack timezone "${name}" in "${range}"`);
+            return moment.tz(wall, moment.ISO_8601, true, zone).valueOf();
+        }
+        const [hh, mm] = offset.slice(1).split(":").map(Number);
+        const minutes = (hh * 60 + mm * 60) * (offset[0] === "-" ? -1 : 1);
+        return wallUtc.valueOf() - minutes * MIN;
+    }
     const local = moment.tz(token, moment.ISO_8601, true, iana);
     if (!local.isValid()) throw new Error(`Unhandled range token "${token}" in "${range}"`);
     return local.valueOf();
