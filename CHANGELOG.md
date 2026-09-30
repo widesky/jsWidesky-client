@@ -11,6 +11,9 @@ This project adheres to [Semantic Versioning](http://semver.org/).
 - [CORE-9209](https://widesky.atlassian.net/browse/CORE-9209): `batch.hisDelete` sizes deletes from server-side record counts instead of reading every row first, and accepts a Haystack range string as well as two Dates.
   - Default request size lowered to 500 rows per point and 10 points per request (was 1500 / 100).
   - Requests rejected for the per-point record limit are halved and retried, up to `maxBisectDepth` times.
+  - A range split into several requests keeps one form the server accepts; a date range is split in each point's timezone.
+  - Ranges it cannot split safely (relative, mixed forms, points without a timezone) are sent unchanged as one request.
+  - `batch.hisDeleteByFilter` uses the same planner, new defaults (500 / 10) and the new options.
 
 ## [3.5.0] - 2026-08-13
 

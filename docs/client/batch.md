@@ -89,19 +89,26 @@ The Object in `client.batch.hisDelete` is expected to have the following structu
 | `parallelDelay`                    | Define the delay between each set of batched requests run in parallel (ms)                                                                                              | Number  |               0                |
 | `returnResult`                     | Enable the result from WideSky API server operation `hisDelete` to be returned                                                                                          | Boolean |            `false`              |
 
-Older versions used a `batchSize` of 1500 rows counted across all entities and a `batchSizeEntity` of 100. Both
-defaults are now lower and `batchSize` is counted per entity, so a caller that relied on the old defaults will send more,
-smaller requests.
+Older versions defaulted `batchSize` to 1500 and `batchSizeEntity` to 100. The defaults are now 500 and 10, so a caller
+that relied on the old defaults will send more, smaller requests.
 
 At debug level the client logs every resolved option once per call, together with whether its value came from the call,
 the client configuration or the default. A call option of `null` counts as not supplied.
 
 #### How the range is planned
-Ids are split into groups of `batchSizeEntity`, in the order given, and each group is planned on its own.
+Ids are split into groups of `batchSizeEntity`, in the order given, and each group is planned on its own. Every group
+is planned (its row counts requested) before any delete is sent.
 
-1. A range that is not a plain absolute range (for example `today`, `yesterday`, a single date or something that cannot
-   be parsed) is not planned. It is sent as one request per group, exactly as given, and cannot be halved. Such ranges
-   are at most a day long.
+1. Only three range forms are planned, because every request of a split plan must use one form the server accepts:
+   - two datetimes ending in `Z`, e.g. `2026-06-01T00:00:00Z,2026-06-04T00:00:00Z`;
+   - two datetimes with an offset and the same timezone name, e.g.
+     `2026-06-01T00:00:00+10:00 Brisbane,2026-06-04T00:00:00+10:00 Brisbane`;
+   - two dates, e.g. `2026-06-01,2026-06-03`.
+
+   Any other range is not planned: relative ranges such as `today` or `yesterday`, a single value, a date paired with a
+   datetime, a datetime without an offset, an offset without a timezone name, two different timezone names, or a range
+   that cannot be parsed. It is sent exactly as given, as one request per group, whatever its length, and cannot be
+   halved. The server accepts or rejects it; a rejection is reported in `errors` as a failed `hisDelete`.
 2. The server is asked for row counts over the range, in buckets of the first unit in `countBucketUnits`. A bucket
    counts as the highest row count of any entity in the group, since the server's limit applies per entity.
 3. Any bucket above `batchSize` is counted again in the next finer unit. A bucket still above `batchSize` at the finest
@@ -109,14 +116,23 @@ Ids are split into groups of `batchSizeEntity`, in the order given, and each gro
 4. Buckets are packed oldest first into requests that keep each entity at or below `batchSize` rows.
 5. The requests are contiguous and together cover the whole range, so rows written while the delete is running still
    fall inside a request.
-6. The first request starts with the start you gave and the last one ends with the end you gave, unchanged, so the range
-   is interpreted by the server exactly as for a single `client.hisDelete`.
+6. When the plan needs only one request, that request sends the range exactly as you gave it. When it is split, every
+   request uses the same form, and deletes the same rows as a single `client.hisDelete` of your range:
+   - `Z` datetimes: the first request keeps your start, the last keeps your end, and the cuts between them are `Z`
+     datetimes;
+   - datetimes with a timezone name: the first and last requests keep your start and end, and the cuts are datetimes in
+     that timezone with the same name, e.g. `2026-06-02T12:00:00.000+10:00 Brisbane`;
+   - dates: see below.
 7. A group with no rows at all still gets one request for the whole range.
+8. A request halved after a record-limit rejection is cut in the same form as the rest of its plan.
 
-If either end of the range has no timezone offset, the server reads it in each point's own timezone. The client reads
-the group's points once and plans each timezone separately. A point with no timezone, or one the client cannot map to a
-known timezone, is planned with a 14 hour margin at each such end: the first and last requests for that point may then
-hold more than `batchSize` rows, and a warning is logged.
+A date range is read by the server in each point's own timezone, so the client reads the group's points once and plans
+each timezone separately. When a split is needed, both ends become datetimes at local midnight in the point's timezone,
+followed by the point's timezone name: the start is midnight at the start of the first date and the end is midnight at
+the start of the day after the last date, e.g. `2026-06-01,2026-06-03` for a Brisbane point becomes
+`2026-06-01T00:00:00.000+10:00 Brisbane` to `2026-06-04T00:00:00.000+10:00 Brisbane`. These are the same instants the
+server uses for the dates. A point with no timezone, or one the client cannot map to a known timezone, is not planned:
+its range is sent exactly as given, as one request, and a warning is logged.
 
 #### Failures and retries
 All planned requests are attempted. Failures do not stop the others; they are collected in `errors`, and requests that
@@ -127,6 +143,8 @@ and `args[0]` tells the two kinds apart:
 |----------------|---------------------------------------------------------------------------------------------------------------------|-------------------------------|
 | `"hisDelete"`  | A delete request failed. Nothing further is done for that request.                                                  | `["hisDelete", ids, range]`   |
 | `"countQuery"` | Counting (or reading timezones) for a group failed. The group is skipped and nothing is deleted for its entities.   | `["countQuery", ids, range]`  |
+
+Row counts and timezone reads are retried like delete requests, with the same `retries` and `retryDelay`.
 
 A request rejected because it exceeds the per-entity record limit ("data points per entity cannot exceed") is halved
 and both halves are sent, up to `maxBisectDepth` times. A request is retried up to `retries` times, waiting `retryDelay`
@@ -230,16 +248,27 @@ The Object in `client.batch.migrateHistory` is expected to have the following st
 | `returnResult`                          | Enable the result from WideSky API server operation `migrateHistory` to be returned | Boolean | `false` |
 
 ### Path `client.batch.hisDeleteByFilter`
+`client.batch.hisDeleteByFilter(filter, start, end, options)` finds the entities matching `filter` and deletes their
+history between two Dates with `client.batch.hisDelete`, planned as described above. `start` and `end` must be Dates.
+
+Options not given in the call come from this path's client configuration, then from the defaults below.
+`client.batch.hisDelete` client configuration does not apply on this path.
+
 The Object in `client.batch.hisDeleteByFilter` is expected to have the following structure:
 
-| Path from `client.batch.hisDeleteByFilter` | Description                                                                            |  Type   | Default |
-|--------------------------------------------|----------------------------------------------------------------------------------------|:-------:|:-------:|
-| `batchSize`                                | Define the maximum size of each payload for `hisDeleteByFilter` operations.            | Number  |   100   |
-| `batchDelay`                               | Define the time in between each batch `hisDeleteByFilter` request (ms).                | Number  |    0    |
-| `parallel`                                 | Define the number of batched requests to be run in parallel                            | Number  |    1    |
-| `parallelDelay`                            | Define the delay between each set of batched requests run in parallel (ms)             | Number  |    0    |
-| `returnResult`                             | Enable the result from WideSky API server operation `hisDeleteByFilter` to be returned | Boolean | `false` |
-| `filter`                                   | Define the maximum number of entities to be returned. 0 means no limit.                | Number  |    0    |
+| Path from `client.batch.hisDeleteByFilter` | Description                                                                                                                  |  Type   |           Default           |
+|--------------------------------------------|------------------------------------------------------------------------------------------------------------------------------|:-------:|:---------------------------:|
+| `batchSize`                                | Define the maximum number of rows to be deleted per entity in a single `hisDelete` request. Between 1 and 3000.              | Number  |             500             |
+| `batchSizeEntity`                          | Define the maximum number of entities in a single `hisDelete` request. Between 1 and 1000.                                   | Number  |             10              |
+| `maxBisectDepth`                           | As for `client.batch.hisDelete`.                                                                                             | Number  |              5              |
+| `countBucketUnits`                         | As for `client.batch.hisDelete`.                                                                                             |  Array  | `["DAY", "HOUR", "MINUTE"]` |
+| `retries`                                  | As for `client.batch.hisDelete`.                                                                                             | Number  |              0              |
+| `retryDelay`                               | As for `client.batch.hisDelete`.                                                                                             | Number  |            2000             |
+| `batchDelay`                               | Define the time in between each batch `hisDelete` request (ms).                                                              | Number  |              0              |
+| `parallel`                                 | Define the number of batched requests to be run in parallel                                                                  | Number  |              1              |
+| `parallelDelay`                            | Define the delay between each set of batched requests run in parallel (ms)                                                   | Number  |              0              |
+| `returnResult`                             | Enable the result from WideSky API server operation `hisDelete` to be returned                                               | Boolean |           `false`           |
+| `limit`                                    | Define the maximum number of entities to be returned by the filter. 0 means no limit.                                        | Number  |              0              |
 
 ### Path `client.batch.updateOrCreate`
 The Object in `client.batch.updateOrCreate` is expected to have the following structure:

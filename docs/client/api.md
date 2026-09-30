@@ -930,19 +930,21 @@ number of entities retrieved from the given filter and limit. The batched payloa
 - `errors`: Return the errors encountered for each failed update operation.
 
 ### WideSkyClient.batch.hisDeleteByFilter(filter, start, end, options)
-**Description:** Perform a hisDelete using a filter to select the entities.  
+**Description:** Perform a hisDelete using a filter to select the entities. The history is deleted with
+`WideSkyClient.batch.hisDelete`, planned from server row counts. See
+[batch.md](batch.md#path-clientbatchhisdeletebyfilter) for the options and their defaults.  
 **Parameters:**
 
-| Param     | Description                                                                                                                                                                                          |  Type  | Default |
-|-----------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|:------:|:-------:|
-| `filter`  | Filter to select the entities to be hisDelete'd.                                                                                                                                                     | String |         |
-| `start`   | Starting timestamp to be deleted as a Date Object.                                                                                                                                                   |  Date  |         |
-| `end`     | Ending timestamp to be deleted as a Data Object (not inclusive).                                                                                                                                     |  Date  |         |
-| `options` | An Object defining batch configurations to be used. See README.md for more information. Option batchSize is determined by the maximum number of time series rows to be deleted across all ids given. | Object |  `{}`   |
+| Param     | Description                                                                                                                                                                                                                  |  Type  | Default |
+|-----------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|:------:|:-------:|
+| `filter`  | Filter to select the entities to be hisDelete'd.                                                                                                                                                                             | String |         |
+| `start`   | Starting timestamp to be deleted as a Date Object.                                                                                                                                                                           |  Date  |         |
+| `end`     | Ending timestamp to be deleted as a Date Object (not inclusive).                                                                                                                                                             |  Date  |         |
+| `options` | An Object defining batch configurations to be used. See batch.md for more information. Option batchSize is the maximum number of rows deleted per entity per request. Client config `batch.hisDelete` does not apply here. | Object |  `{}`   |
 
-**Returns:** `Promise<{success: Array, errors: Array<{errors: String, args: Array}>}>`
+**Returns:** `Promise<{success: Array, errors: Array<{error: String, args: Array}>}>`
 - `success`: Return the result of each successful hisDelete operation when `options.returnResult` is `true`.
-- `errors`: Return any errors encountered when performing hisDelete operations.
+- `errors`: Return any errors encountered. `args[0]` is `"findAsId"`, `"hisDelete"` or `"countQuery"`.
 
 ### WideSkyClient.batch.migrateHistory(fromEntity, toEntity, options)
 **Description:** Perform a historical data migration between fromEntity and toEntity using batch functionality.  
