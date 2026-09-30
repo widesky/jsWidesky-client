@@ -15,6 +15,9 @@ const t = (iso) => Date.parse(iso);
 const every = (fromIso, count, stepMs) => Array.from({ length: count }, (_, i) => t(fromIso) + i * stepMs);
 const deletes = (fake) => fake.requests.filter((r) => r.uri === "/api/hisDelete");
 const counts = (fake) => fake.requests.filter((r) => r.uri === "/graphql");
+// Range tokens: "2026-09-01T00:00:00Z", or "2026-09-01T10:00:00.000+10:00 Brisbane".
+const ends = (r) => r.range.replace(/^s:/, "").split(",");
+const tokMs = (tok) => Date.parse(tok.split(" ")[0]);
 
 function client(points, fakeOpts = {}, clientOptions) {
     const ws = stubs.getInstance(new stubs.StubHTTPClient(), new stubs.StubLogger(),
@@ -61,10 +64,17 @@ describe("client.batch.hisDelete", () => {
 
         it("keeps the caller's start and end tokens on the first and last request", async () => {
             const range = "2026-09-01T10:00:00+10:00 Brisbane,2026-09-04T10:00:00+10:00 Brisbane";
-            await ws.batch.hisDelete([PT.chwFlowTemp], range);
+            const res = await ws.batch.hisDelete([PT.chwFlowTemp], range);
+            expect(res.errors).to.eql([]);
             const ranges = deletes(fake).map((r) => r.range);
+            expect(ranges.length).to.be.greaterThan(1);
             expect(ranges[0].startsWith("s:2026-09-01T10:00:00+10:00 Brisbane,")).to.be.true;
             expect(ranges[ranges.length - 1].endsWith(",2026-09-04T10:00:00+10:00 Brisbane")).to.be.true;
+            // Interior boundaries are written in the same zone with the same name.
+            for (const r of deletes(fake).slice(1)) {
+                expect(ends(r)[0]).to.match(/^2026-09-0\dT\d{2}:\d{2}:\d{2}\.\d{3}\+10:00 Brisbane$/);
+            }
+            expect(fake.rows(PT.chwFlowTemp)).to.eql([...outsideBefore, ...outsideAfter].sort((a, b) => a - b));
         });
 
         it("tiles the range with contiguous requests", async () => {
@@ -200,27 +210,75 @@ describe("client.batch.hisDelete", () => {
             await ws.batch.hisDelete([BNE, NYC], RANGE_LOCAL);
             for (const [id, p] of [[BNE, bne], [NYC, nyc]]) {
                 const mine = deletes(fake).filter((r) => r.ids.includes(id));
-                const interior = mine.slice(1).map((r) => Date.parse(r.range.replace(/^s:/, "").split(",")[0]));
+                const interior = mine.slice(1).map((r) => tokMs(ends(r)[0]));
                 expect(interior.length).to.be.greaterThan(0);
                 for (const b of interior) expect(b).to.be.within(p.from + 1, p.to - 1);
-                expect(mine[0].range.startsWith("s:2026-09-01,")).to.be.true;
-                expect(mine[mine.length - 1].range.endsWith(",2026-09-03")).to.be.true;
             }
         });
 
-        it("falls back to the 14-hour margin for a point with no timezone", async () => {
+        it("writes every request of a split plan as datetimes in the point's zone and tz name", async () => {
+            const { ws, fake } = two();
+            const res = await ws.batch.hisDelete([BNE, NYC], RANGE_LOCAL);
+            expect(res.errors).to.eql([]);
+            for (const [id, first, last, name] of [
+                [BNE, "2026-09-01T00:00:00.000+10:00 Brisbane", "2026-09-04T00:00:00.000+10:00 Brisbane", "Brisbane"],
+                [NYC, "2026-09-01T00:00:00.000-04:00 New_York", "2026-09-04T00:00:00.000-04:00 New_York", "New_York"]
+            ]) {
+                const mine = deletes(fake).filter((r) => r.ids.includes(id));
+                expect(mine.length, id).to.be.greaterThan(1);
+                expect(ends(mine[0])[0]).to.equal(first);
+                expect(ends(mine[mine.length - 1])[1]).to.equal(last);
+                for (const r of mine) for (const tok of ends(r)) expect(tok.endsWith(` ${name}`), tok).to.be.true;
+            }
+        });
+
+        it("sends a date-only range verbatim when it needs only one request", async () => {
+            const bne = localPoint("Brisbane", "Australia/Brisbane");
+            const { ws, fake } = client({ [BNE]: { tz: "Brisbane", rows: [bne.from - 1, bne.from, bne.to - 1, bne.to] } });
+            await ws.batch.hisDelete([BNE], RANGE_LOCAL);
+            expect(deletes(fake).map((r) => r.range)).to.eql([`s:${RANGE_LOCAL}`]);
+            expect(fake.rows(BNE)).to.eql([bne.from - 1, bne.to]);
+        });
+
+        it("bisects a date-only request in the point's zone form", async () => {
+            // Planned as one verbatim request; rows arriving after planning push it over the limit.
+            const bne = localPoint("Brisbane", "Australia/Brisbane");
+            const rows = every(new Date(bne.from).toISOString(), 1500, MIN);
+            const { ws, fake } = client({ [BNE]: { tz: "Brisbane", rows } });
+            fake.beforeFirstDelete((server) => {
+                server.points.get(BNE).rows.push(...every(new Date(bne.from + 2 * DAY).toISOString(), 400, MIN));
+                server.points.get(BNE).rows.sort((a, b) => a - b);
+            });
+            const res = await ws.batch.hisDelete([BNE], RANGE_LOCAL, { batchSize: 1500 });
+            expect(res.errors).to.eql([]);
+            expect(fake.rows(BNE)).to.eql([]);
+            const sent = deletes(fake).map((r) => r.range);
+            expect(sent[0]).to.equal(`s:${RANGE_LOCAL}`);
+            expect(sent.slice(1)).to.eql([
+                "s:2026-09-01T00:00:00.000+10:00 Brisbane,2026-09-02T12:00:00.000+10:00 Brisbane",
+                "s:2026-09-02T12:00:00.000+10:00 Brisbane,2026-09-04T00:00:00.000+10:00 Brisbane"
+            ]);
+        });
+
+        it("sends the caller's range verbatim, unsplit, for a point with no or an unmappable timezone", async () => {
             const NOTZ = "0a0b0c0d-0000-4a5b-8c9d-00000000000a";
-            // The fake resolves a point without tz in UTC; data is 1-minute across the UTC days.
+            const ODDTZ = "0a0b0c0d-0000-4a5b-8c9d-00000000000b";
+            // The fake resolves a date-only range in UTC for these points; the server decides.
             const from = Date.parse("2026-09-01T00:00:00Z"), to = Date.parse("2026-09-04T00:00:00Z");
-            const rows = [from - 1, ...every("2026-09-01T00:00:00Z", 3 * 1440, MIN), to];
-            const { ws, fake } = client({ [NOTZ]: { tz: null, rows } });
+            const rows = [from - 1, ...every("2026-09-01T00:00:00Z", 3 * 24, HOUR), to];
+            const { ws, fake } = client({ [NOTZ]: { tz: null, rows }, [ODDTZ]: { tz: "Mawson_Station", rows }, [BNE]: localPoint("Brisbane", "Australia/Brisbane") });
             const warn = ws.logger.warn;   // StubLogger already stubs warn; read its recorded calls
-            const res = await ws.batch.hisDelete([NOTZ], RANGE_LOCAL);
+            const res = await ws.batch.hisDelete([NOTZ, ODDTZ, BNE], RANGE_LOCAL);
             expect(res.errors).to.eql([]);
             expect(fake.rows(NOTZ)).to.eql([from - 1, to]);
-            expect(warn.getCalls().some((c) => c.args.join(" ").includes("14 h margin"))).to.be.true;
-            const interior = deletes(fake).slice(1).map((r) => Date.parse(r.range.replace(/^s:/, "").split(",")[0]));
-            for (const b of interior) expect(b).to.be.within(from + 14 * HOUR, to - 14 * HOUR);
+            expect(fake.rows(ODDTZ)).to.eql([from - 1, to]);
+            for (const id of [NOTZ, ODDTZ]) {
+                expect(deletes(fake).filter((r) => r.ids.includes(id)).map((r) => r.range), id).to.eql([`s:${RANGE_LOCAL}`]);
+                expect(counts(fake).some((r) => r.ids.includes(id)), id).to.be.false;
+            }
+            // The Brisbane point in the same group is still planned and split.
+            expect(deletes(fake).filter((r) => r.ids.includes(BNE)).length).to.be.greaterThan(1);
+            expect(warn.getCalls().filter((c) => c.args.join(" ").includes("one unplanned request"))).to.have.length(2);
         });
 
         it("skips a group whose timezone read fails, and deletes nothing from it", async () => {
@@ -231,6 +289,38 @@ describe("client.batch.hisDelete", () => {
             expect(res.errors).to.eql([{ error: "Read failed", args: ["countQuery", [BNE, NYC], RANGE_LOCAL] }]);
             expect(deletes(fake)).to.eql([]);
             expect(fake.rows(BNE)).to.have.length(bne.rows.length);
+        });
+    });
+
+    describe("ranges the planner does not split", () => {
+        // Each is sent verbatim, one request per group, and the server decides. The fake rejects
+        // them exactly as the API server's HDateTimeRange.make does, so the error is reported.
+        for (const [range, error] of [
+            ["2026-09-01,2026-09-04T00:00:00Z", "Invalid HDateTimeRange: 2026-09-01,2026-09-04T00:00:00Z"],
+            ["2026-09-01T00:00:00+10:00,2026-09-04T00:00:00+10:00", "Expected space between timezone offset and name"],
+            ["2026-09-01T00:00:00,2026-09-04T00:00:00", "Expected -/+ for timezone offset"],
+            ["2026-09-01T00:00:00+10:00 Brisbane,2026-09-04T00:00:00+10:00 Sydney", "arg1.tz != arg2.tz"]
+        ]) {
+            it(`sends ${range} as one unplanned request`, async () => {
+                const { ws, fake } = client({ [PT.chwFlowTemp]: { tz: "Brisbane", rows: every("2026-09-01T00:00:00Z", 3 * 1440, MIN) } });
+                const res = await ws.batch.hisDelete([PT.chwFlowTemp], range);
+                expect(counts(fake)).to.eql([]);
+                expect(deletes(fake).map((r) => r.range)).to.eql([`s:${range}`]);
+                expect(res.errors).to.eql([{ error, args: ["hisDelete", [PT.chwFlowTemp], `s:${range}`] }]);
+            });
+        }
+
+        it("the fake accepts only the range forms the API server accepts", () => {
+            const { parseRange } = require("./fakeHistoryServer");
+            for (const ok of ["yesterday", "2026-09-01,2026-09-03", "2026-09-01T00:00:00Z,2026-09-02T00:00:00.000Z",
+                "2026-09-01T00:00:00Z UTC,2026-09-02T00:00:00+00:00 UTC",
+                "2026-09-01T00:00:00+10:00 Brisbane,2026-09-02T00:00:00.000+10:00 Brisbane"]) {
+                expect(() => parseRange(`s:${ok}`), ok).to.not.throw();
+            }
+            for (const bad of ["2026-09-01T00:00:00Z,2026-09-02", "2026-09-01T00:00:00Z,2026-09-02T00:00:00+10:00 Brisbane",
+                "2026-09-01T00:00:00+10:00,2026-09-02T00:00:00+10:00", "2026-09-01T00:00:00,2026-09-02T00:00:00"]) {
+                expect(() => parseRange(`s:${bad}`), bad).to.throw();
+            }
         });
     });
 

@@ -42,6 +42,11 @@ describe("hisDelete e2e helpers", () => {
             });
         }
 
+        it("resolves the zone-named form the planner writes for a split date-only range", () => {
+            const range = "s:2026-06-01T00:00:00.000-04:00 New_York,2026-06-02T12:30:00.000-04:00 New_York";
+            expect(iso(H.resolveRange(range, "New_York"))).to.eql(["2026-06-01T04:00:00.000Z", "2026-06-02T16:30:00.000Z"]);
+        });
+
         it("resolves yesterday and today from nowMs in Brisbane", () => {
             expect(iso(H.resolveRange("yesterday", "Brisbane", NOW))).to.eql(["2026-09-28T14:00:00.000Z", "2026-09-29T14:00:00.000Z"]);
             expect(iso(H.resolveRange("today", "Brisbane", NOW))).to.eql(["2026-09-29T14:00:00.000Z", "2026-09-30T14:00:00.000Z"]);

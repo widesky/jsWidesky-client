@@ -413,11 +413,16 @@ function chunkIds(ids, size) {
  *
  * Planning never reads the rows being deleted: each group of `batchSizeEntity` ids is counted
  * per `countBucketUnits[0]`, over-budget buckets are re-counted at finer units, and buckets are
- * packed into contiguous requests of at most `batchSize` rows per entity. The first and last
- * request keep the caller's range-end tokens, so range semantics match one plain hisDelete.
- * When a range end has no offset, each group is read once and split by point timezone so the
- * plan uses each point's exact local range. Relative ranges ("today", "yesterday", ...) are sent
- * as one request per group.
+ * packed into contiguous requests of at most `batchSize` rows per entity. A plan that needs one
+ * request sends the caller's range verbatim. A split plan keeps every request in one range form
+ * the API server accepts (see hisDeletePlan.parseRange):
+ *   - both ends "...Z": boundaries are ISO "Z" instants, first/last keep the caller's tokens;
+ *   - both ends "<offset> <TzName>" with the same name: boundaries in that zone with that name;
+ *   - both ends dates: each group is read once and split by point timezone; both ends become
+ *     local-midnight datetimes with the point's tz name (end = the day after the end date).
+ * Any other range (relative keywords, mixed forms, a missing offset or tz name, two tz names), and
+ * a date-only range on a point with no usable tz, is sent verbatim as one request per group for
+ * the server to accept or reject.
  *
  * @param ids Point ids (array or single id).
  * @param range Haystack range string (with or without "s:"), or a Date for the start.
@@ -465,8 +470,10 @@ async function hisDelete(ids, range, endOrOptions, maybeOptions) {
             requests.push(unplannedRequest(group, parsed.raw));
             continue;
         }
-        let subGroups = [{ zone: "UTC", ids: group }];   // every end carries an offset: zone is irrelevant
-        if (parsed.tzLess) {
+        // Datetime ends carry their own timezone, so the whole group shares one window. Date-only
+        // ends resolve in each point's timezone, so the group is read once and split by tz.
+        let subGroups = [{ ids: group }];
+        if (parsed.form === "date") {
             try {
                 subGroups = await groupByZone((groupIds) => this.read(groupIds), group);
             } catch (error) {
@@ -475,14 +482,17 @@ async function hisDelete(ids, range, endOrOptions, maybeOptions) {
             }
         }
         for (const sub of subGroups) {
-            if (sub.zone === null) {
-                this.logger.warn("batch.hisDelete: no usable tz on %s; planning %s with a 14 h margin",
-                    sub.ids.join(","), range);
+            const window = windowFor(parsed, sub);
+            if (!window) {
+                this.logger.warn("batch.hisDelete: no usable tz (%s) on %s; sending %s as one unplanned request",
+                    sub.hsTz, sub.ids.join(","), range);
+                requests.push(unplannedRequest(sub.ids, parsed.raw));
+                continue;
             }
             const countFn = async (fromMs, toMs, unit) =>
                 parseCountResponse(await this.query(buildCountQuery(sub.ids, fromMs, toMs, unit)), unit);
             try {
-                requests.push(...(await planGroup(countFn, sub.ids, parsed, windowFor(parsed, sub.zone), resolved)));
+                requests.push(...(await planGroup(countFn, sub.ids, parsed, window, resolved)));
             } catch (error) {
                 errors.push({ error: error.message, args: ["countQuery", sub.ids, range] });
             }

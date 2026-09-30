@@ -7,11 +7,11 @@ const UNIT_MS = Object.freeze({
     WEEK: 604800000, DAY: 86400000, HOUR: 3600000, MINUTE: 60000, SECOND: 1000
 });
 
-// Largest UTC offset in use (UTC+14). Fallback margin for an offset-less range end on a point
-// whose timezone is unknown: every possible resolution lies within this distance of UTC.
-const TZ_MARGIN_MS = 14 * 3600000;
-const OFFSET_RE = /(Z|[+-]\d{2}:?\d{2})$/i;
 const DATE_ONLY_RE = /^\d{4}-\d{2}-\d{2}$/;
+// A Zinc datetime as the API server reads it: offset "Z" or "+hh:mm" (colon required), then an
+// optional " TzName". The server requires the name after "+hh:mm"; "Z" alone means UTC.
+const DATETIME_RE = /^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?)(Z|[+-]\d{2}:\d{2})(?: (\S+))?$/;
+const ZONED_FORMAT = "YYYY-MM-DDTHH:mm:ss.SSSZ";
 
 const toIso = (ms) => new Date(ms).toISOString();
 
@@ -26,76 +26,101 @@ function ianaZone(hsTz) {
     return moment.tz.names().find((n) => n.split("/").pop() === name) || null;
 }
 
-function parseEnd(token, isEnd) {
-    const iso = token.trim().split(" ")[0];
-    if (DATE_ONLY_RE.test(iso)) {
-        return moment.utc(iso, "YYYY-MM-DD", true).isValid() ? { iso, isEnd, dateOnly: true, tzLess: true } : null;
-    }
-    const hasOffset = OFFSET_RE.test(iso);
-    const m = hasOffset ? moment.parseZone(iso, moment.ISO_8601, true) : moment.utc(iso, moment.ISO_8601, true);
-    return m.isValid() ? { iso, isEnd, dateOnly: false, tzLess: !hasOffset, ms: hasOffset ? m.valueOf() : undefined } : null;
-}
+// A boundary written in `iana` with the Haystack name the server needs after the offset.
+const zonedFormat = (iana, hsName) => (ms) => `${moment(ms).tz(iana).format(ZONED_FORMAT)} ${hsName}`;
 
-// Resolve one end in `zone` (IANA, or null for unknown). A date-only end includes that whole
-// local day. Returns the instant and the margin that still applies to it.
-function resolveEnd(end, zone) {
-    if (!end.tzLess) return { ms: end.ms, margin: 0 };
-    const tz = zone || "UTC";
-    const m = end.dateOnly ? moment.tz(end.iso, "YYYY-MM-DD", tz) : moment.tz(end.iso, moment.ISO_8601, tz);
-    if (end.dateOnly && end.isEnd) m.add(1, "day");
-    return { ms: m.valueOf(), margin: zone ? 0 : TZ_MARGIN_MS };
+function parseEnd(token) {
+    const tok = token.trim();
+    if (DATE_ONLY_RE.test(tok)) {
+        return moment.utc(tok, "YYYY-MM-DD", true).isValid() ? { kind: "date", iso: tok } : null;
+    }
+    const m = tok.match(DATETIME_RE);
+    if (!m) return null;
+    const [, local, offset, name] = m;
+    const parsed = moment.parseZone(local + offset, moment.ISO_8601, true);
+    if (!parsed.isValid()) return null;
+    if (offset === "Z" && (!name || name === "UTC")) return { kind: "zulu", tok, ms: parsed.valueOf(), tzName: "UTC" };
+    return name ? { kind: "named", tok, ms: parsed.valueOf(), tzName: name } : null;
 }
 
 /**
- * Parse a Haystack range for planning. Relative keywords, single values and unparseable input
- * are not plannable; the caller sends them as-is.
+ * Classify a Haystack range for planning. Every request of a split plan must use ONE range form
+ * the API server accepts (HDateTimeRange.make: two dates, or two datetimes with the same tz name):
+ *   "utc"   both ends "...Z": interior boundaries are ISO "Z" instants;
+ *   "named" both ends "<offset> <TzName>" with the same, mappable name: interior boundaries are
+ *           written in that zone with that name;
+ *   "date"  both ends dates: per timezone sub-group, both ends become local-midnight datetimes
+ *           (the end is the day after the end date) with the point's tz name (see windowFor).
+ * Anything else (relative keywords, one value, mixed forms, an offset without a name, a datetime
+ * without an offset, two different names, an empty or inverted range) is not plannable: the
+ * caller's range is sent verbatim, one request per group, and the server decides.
  */
 function parseRange(range) {
     const raw = range.startsWith("s:") ? range.slice(2) : range;
     const parts = raw.split(",");
     if (parts.length !== 2) return { plannable: false, raw };
-    const start = parseEnd(parts[0], false);
-    const end = parseEnd(parts[1], true);
+    const start = parseEnd(parts[0]);
+    const end = parseEnd(parts[1]);
     if (!start || !end) return { plannable: false, raw };
-    const parsed = {
-        plannable: true, raw, start, end,
-        startTok: parts[0].trim(), endTok: parts[1].trim(),
-        tzLess: start.tzLess || end.tzLess
-    };
-    const probe = windowFor(parsed, "UTC");
-    return probe.safeStart < probe.safeEnd ? parsed : { plannable: false, raw };
+    if (start.kind === "date" && end.kind === "date") {
+        return start.iso <= end.iso ? { plannable: true, raw, form: "date", start, end } : { plannable: false, raw };
+    }
+    if (start.kind === "date" || end.kind === "date" || start.tzName !== end.tzName || !(start.ms < end.ms)) {
+        return { plannable: false, raw };
+    }
+    if (start.kind === "zulu" && end.kind === "zulu") {
+        return { plannable: true, raw, form: "utc", start, end };
+    }
+    const iana = ianaZone(start.tzName);
+    return iana ? { plannable: true, raw, form: "named", start, end, iana } : { plannable: false, raw };
 }
 
 /**
- * The absolute window a sub-group of points in `zone` is planned over. countStart/countEnd bound
- * the histogram; safeStart/safeEnd bound interior boundaries, so no request can start before or
- * end after any point's resolved range. Equal for a known zone; widened / narrowed by the
- * fallback margin for an unknown zone.
+ * The window a (sub-)group is planned over, and how its request ends are written. `zone` is the
+ * sub-group's {iana, hsTz} for a "date" range, ignored otherwise. Returns null for a "date" range
+ * whose sub-group has no mappable timezone (rule: send the caller's range verbatim).
+ *   startMs/endMs      the absolute range, used for the COUNT histogram and to place boundaries;
+ *   startTok/endTok    the first request's start and the last request's end in a split plan;
+ *   format(ms)         an interior boundary (and a bisection midpoint) in the same form.
  */
 function windowFor(parsed, zone) {
-    const s = resolveEnd(parsed.start, zone);
-    const e = resolveEnd(parsed.end, zone);
-    return { countStart: s.ms - s.margin, countEnd: e.ms + e.margin, safeStart: s.ms + s.margin, safeEnd: e.ms - e.margin };
+    if (parsed.form === "utc") {
+        return { startMs: parsed.start.ms, endMs: parsed.end.ms, startTok: parsed.start.tok, endTok: parsed.end.tok, format: toIso };
+    }
+    if (parsed.form === "named") {
+        return {
+            startMs: parsed.start.ms, endMs: parsed.end.ms, startTok: parsed.start.tok, endTok: parsed.end.tok,
+            format: zonedFormat(parsed.iana, parsed.start.tzName)
+        };
+    }
+    if (!zone || !zone.iana) return null;
+    // Same instants as the server's HDate.midnight(start) and HDate.midnight(end + 1 day) in the
+    // point's timezone, so converting the ends does not change what is deleted.
+    const startMs = moment.tz(parsed.start.iso, "YYYY-MM-DD", zone.iana).valueOf();
+    const endMs = moment.tz(parsed.end.iso, "YYYY-MM-DD", zone.iana).add(1, "day").valueOf();
+    const format = zonedFormat(zone.iana, zone.hsTz);
+    return { startMs, endMs, startTok: format(startMs), endTok: format(endMs), format };
 }
 
 /**
- * Split ids by the IANA zone of their `tz` tag, keeping first-seen order. Ids with no or an
- * unmappable tz are grouped under zone null.
+ * Split ids by the raw Haystack `tz` tag of each point, keeping first-seen order. Each sub-group
+ * carries that name (written after the offset of its converted range ends) and its IANA zone;
+ * ids with no tz tag, or one that does not map to an IANA zone, get iana null.
  */
 async function groupByZone(readFn, ids) {
     const grid = await readFn(ids);
-    const zoneById = new Map();
+    const tzById = new Map();
     for (const row of lodash.get(grid, "rows", []) || []) {
         const id = String(row.id || "").replace(/^r:/, "").split(" ")[0];
-        zoneById.set(id, ianaZone(row.tz));
+        tzById.set(id, row.tz ? String(row.tz).replace(/^s:/, "") : null);
     }
     const groups = new Map();
     for (const id of ids) {
-        const zone = zoneById.get(String(id).replace(/^r:/, "")) || null;
-        if (!groups.has(zone)) groups.set(zone, []);
-        groups.get(zone).push(id);
+        const hsTz = tzById.get(String(id).replace(/^r:/, "")) || null;
+        if (!groups.has(hsTz)) groups.set(hsTz, []);
+        groups.get(hsTz).push(id);
     }
-    return [...groups.entries()].map(([zone, groupIds]) => ({ zone, ids: groupIds }));
+    return [...groups.entries()].map(([hsTz, groupIds]) => ({ hsTz, iana: ianaZone(hsTz), ids: groupIds }));
 }
 
 function buildCountQuery(ids, fromMs, toMs, unit) {
@@ -160,13 +185,13 @@ async function refineBucket(countFn, bucket, units, level, batchSize) {
 
 /**
  * Greedy-pack buckets under the budget. A new request may only start at a bucket edge strictly
- * inside the safe interior; otherwise the bucket folds into the current request.
+ * inside the window; otherwise the bucket folds into the current request.
  */
-function interiorBoundaries(buckets, batchSize, safeStart, safeEnd) {
+function interiorBoundaries(buckets, batchSize, startMs, endMs) {
     const boundaries = [];
     let running = 0;
     for (const b of buckets) {
-        const canCut = b.start > safeStart && b.start < safeEnd;
+        const canCut = b.start > startMs && b.start < endMs;
         if (running > 0 && running + b.count > batchSize && canCut) {
             boundaries.push(b.start);
             running = 0;
@@ -176,47 +201,62 @@ function interiorBoundaries(buckets, batchSize, safeStart, safeEnd) {
     return boundaries;
 }
 
-function makeRequest(ids, startTok, endTok, startMs, endMs, depth) {
-    return { ids, startTok, endTok, startMs, endMs, depth, range: `s:${startTok},${endTok}` };
+// `range` is what is sent. startTok/endTok/format are the window's form, used whenever the
+// request is split, so every piece of a split stays in one server-accepted form.
+function makeRequest(ids, window, startTok, endTok, startMs, endMs, depth, range) {
+    return {
+        ids, startTok, endTok, startMs, endMs, depth, format: window.format,
+        range: range || `s:${startTok},${endTok}`
+    };
 }
 
+/** One request with the caller's range verbatim, never bisected (not plannable, or rule d). */
 function unplannedRequest(ids, raw) {
-    return { ids, startTok: null, endTok: null, startMs: NaN, endMs: NaN, depth: 0, range: `s:${raw}` };
+    return { ids, startTok: null, endTok: null, startMs: NaN, endMs: NaN, depth: 0, format: null, range: `s:${raw}` };
 }
 
+/**
+ * Requests for a window cut at `boundaries`. With no boundary the one request sends the caller's
+ * range verbatim (it still carries the window's form, for bisection).
+ */
 function buildRequests(ids, parsed, window, boundaries) {
+    if (boundaries.length === 0) {
+        return [makeRequest(ids, window, window.startTok, window.endTok, window.startMs, window.endMs, 0, `s:${parsed.raw}`)];
+    }
     const edges = [
-        { tok: parsed.startTok, ms: window.safeStart },
-        ...boundaries.map((ms) => ({ tok: toIso(ms), ms })),
-        { tok: parsed.endTok, ms: window.safeEnd }
+        { tok: window.startTok, ms: window.startMs },
+        ...boundaries.map((ms) => ({ tok: window.format(ms), ms })),
+        { tok: window.endTok, ms: window.endMs }
     ];
     const requests = [];
     for (let i = 0; i < edges.length - 1; i++) {
-        requests.push(makeRequest(ids, edges[i].tok, edges[i + 1].tok, edges[i].ms, edges[i + 1].ms, 0));
+        requests.push(makeRequest(ids, window, edges[i].tok, edges[i + 1].tok, edges[i].ms, edges[i + 1].ms, 0));
     }
     return requests;
 }
 
 async function planGroup(countFn, ids, parsed, window, { batchSize, countBucketUnits }) {
-    const coarse = await countFn(window.countStart, window.countEnd, countBucketUnits[0]);
+    const coarse = await countFn(window.startMs, window.endMs, countBucketUnits[0]);
     const buckets = [];
     for (const b of coarse) {
         buckets.push(...(await refineBucket(countFn, b, countBucketUnits, 0, batchSize)));
     }
-    return buildRequests(ids, parsed, window, interiorBoundaries(buckets, batchSize, window.safeStart, window.safeEnd));
+    return buildRequests(ids, parsed, window, interiorBoundaries(buckets, batchSize, window.startMs, window.endMs));
 }
 
 /**
- * Halve a request at its midpoint. startMs/endMs of an original end token are the safe-interior
- * bounds, so the midpoint always lies inside the safe interior. Returns null when it cannot be
- * split (unplanned, or no safe interior).
+ * Halve a request at its midpoint, written in the request's own form. Returns null when it
+ * cannot be split (unplanned, or too short to halve).
  */
 function splitRequest(req) {
+    if (!req.format) return null;
     const mid = Math.floor((req.startMs + req.endMs) / 2);
     if (!(mid > req.startMs && mid < req.endMs)) return null;
+    const window = { format: req.format };
+    const midTok = req.format(mid);
     return [
-        makeRequest(req.ids, req.startTok, toIso(mid), req.startMs, mid, req.depth + 1),
-        makeRequest(req.ids, toIso(mid), req.endTok, mid, req.endMs, req.depth + 1)
+        makeRequest(req.ids, window, req.startTok, midTok, req.startMs, mid, req.depth + 1),
+        makeRequest(req.ids, window, midTok, req.endTok, mid, req.endMs, req.depth + 1)
     ];
 }
 
