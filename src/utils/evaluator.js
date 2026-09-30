@@ -191,6 +191,41 @@ const BATCH_HIS_DELETE_BY_FILTER_SCHEMA = yup.object({
     ...PERFORM_OP_IN_BATCH_OBJ,
     ...getBatchProp(HIS_DELETE_DATA_POINT_BATCH_SIZE, HIS_DELETE_DATA_POINT_BATCH_SIZE_MAX),
     ...getBatchProp(HIS_DELETE_ENTITY_BATCH_SIZE, HIS_DELETE_ENTITY_BATCH_SIZE_MAX, "batchSizeEntity"),
+    maxBisectDepth: yup.number()
+        .notRequired()
+        .nullable()
+        .strict()
+        .integer()
+        .min(0)
+        .max(HIS_DELETE_MAX_BISECT_DEPTH_MAX)
+        .default(HIS_DELETE_MAX_BISECT_DEPTH),
+    // Not nullable: the planner always needs at least one level.
+    countBucketUnits: yup.array()
+        .of(yup.string().oneOf(HIS_DELETE_BUCKET_UNIT_ORDER))
+        .strict()
+        .min(1)
+        .test(
+            "coarse-to-fine",
+            "countBucketUnits must be ordered coarse to fine without duplicates",
+            (units) => units == null || units.every((unit, i) => i === 0 ||
+                HIS_DELETE_BUCKET_UNIT_ORDER.indexOf(unit) > HIS_DELETE_BUCKET_UNIT_ORDER.indexOf(units[i - 1]))
+        )
+        .default(() => [...HIS_DELETE_COUNT_BUCKET_UNITS]),
+    retries: yup.number()
+        .notRequired()
+        .nullable()
+        .strict()
+        .integer()
+        .min(0)
+        .max(HIS_DELETE_RETRIES_MAX)
+        .default(0),
+    retryDelay: yup.number()
+        .notRequired()
+        .nullable()
+        .strict()
+        .integer()
+        .min(0)
+        .default(HIS_DELETE_RETRY_DELAY),
     ...getReturnResultProp(false),
     ...LIMIT_PROPERTY
 });

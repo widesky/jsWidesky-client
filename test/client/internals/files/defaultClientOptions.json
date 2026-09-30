@@ -32,19 +32,27 @@
     },
     "hisDelete": {
       "batchDelay": 0,
-      "batchSize": 1500,
-      "batchSizeEntity": 100,
+      "batchSize": 500,
+      "batchSizeEntity": 10,
+      "countBucketUnits": ["DAY", "HOUR", "MINUTE"],
+      "maxBisectDepth": 5,
       "parallel": 1,
       "parallelDelay": 0,
+      "retries": 0,
+      "retryDelay": 2000,
       "returnResult": false
     },
     "hisDeleteByFilter": {
       "batchDelay": 0,
-      "batchSize": 1500,
-      "batchSizeEntity": 100,
+      "batchSize": 500,
+      "batchSizeEntity": 10,
+      "countBucketUnits": ["DAY", "HOUR", "MINUTE"],
       "limit": 0,
+      "maxBisectDepth": 5,
       "parallel": 1,
       "parallelDelay": 0,
+      "retries": 0,
+      "retryDelay": 2000,
       "returnResult": false
     },
     "hisRead": {
