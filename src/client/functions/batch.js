@@ -16,6 +16,11 @@ const {
     BATCH_MULTI_FIND_SCHEMA,
     BATCH_UPDATE_OR_CREATE_SCHEMA
 } = require("../../utils/evaluator");
+const lodash = require("lodash");
+const {
+    parseRange, groupByZone, windowFor, buildCountQuery, parseCountResponse, planGroup, unplannedRequest, splitRequest
+} = require("./hisDeletePlan");
+const { withRetry, isRecordLimitError } = require("./hisDeleteRetry");
 const HisWritePayload = require("../../utils/hisWritePayload");
 const { sleep } = require("../../utils/tools");
 const Hs = require("../../utils/haystack");
@@ -390,299 +395,135 @@ async function hisRead(ids, from, to, options={}) {
     };
 }
 
-/**
- * Find the number of rows between the given times timeStart and timeEnd.
- * @param data Data to search within.
- * @param timeStart Starting epoch time range.
- * @param timeEnd Ending epoch time range.
- * @returns {number} Number of time series rows found.
- */
-function rowsBetweenRange(data, timeStart, timeEnd) {
-    let i = 0;
-    let count = 0;
-    const getDate = (ts) => Date.parse(Hs.removePrefix(ts));
-    while (data[i] && getDate(data[i].ts) < timeStart) {
-        i++;
-    }
+const HIS_DELETE_OPTION_KEYS = [
+    "batchSize", "batchSizeEntity", "maxBisectDepth", "countBucketUnits",
+    "retries", "retryDelay", "parallel", "batchDelay", "parallelDelay"
+];
 
-    if (data[i] === undefined) {
-        // found start point exceeds data sets endpoint. No data between time range
-        return 0;
+function chunkIds(ids, size) {
+    const groups = [];
+    for (let i = 0; i < ids.length; i += size) {
+        groups.push(ids.slice(i, i + size));
     }
-
-    for (; i < data.length; i++) {
-        if (data[i] === undefined || getDate(data[i].ts) > timeEnd) {
-            break;
-        }
-        count++;
-    }
-
-    return count;
+    return groups;
 }
 
 /**
- * Get the end time in the data set that has at most the given batchSize records.
- * @param dataSet Data set to search in.
- * @param grabFromIndex A start index to signify what will be batched next.
- * @param batchSize Maximum number of time series data that can be deleted.
- * @returns {number|null} The index of the endRange time found. If data set is empty, null is returned.
+ * Delete history in bounded requests planned from GraphQL COUNT histograms.
+ *
+ * Planning never reads the rows being deleted: each group of `batchSizeEntity` ids is counted
+ * per `countBucketUnits[0]`, over-budget buckets are re-counted at finer units, and buckets are
+ * packed into contiguous requests of at most `batchSize` rows per entity. The first and last
+ * request keep the caller's range-end tokens, so range semantics match one plain hisDelete.
+ * When a range end has no offset, each group is read once and split by point timezone so the
+ * plan uses each point's exact local range. Relative ranges ("today", "yesterday", ...) are sent
+ * as one request per group.
+ *
+ * @param ids Point ids (array or single id).
+ * @param range Haystack range string (with or without "s:"), or a Date for the start.
+ * @param endOrOptions Date end (not inclusive) when `range` is a Date; otherwise the options.
+ * @param maybeOptions Options when called with two Dates. See docs/client/batch.md.
+ * @returns {Promise<{success: Array, errors: Array<{error: String, args: Array}>}>}
+ *          errors[].args[0] is "hisDelete" for a failed delete and "countQuery" for a failed
+ *          count; a group whose count fails is not deleted.
  */
-function endTimeRange(dataSet, grabFromIndex, batchSize) {
-    if (dataSet.length === 0 || grabFromIndex >= dataSet.length) {
-        return null;
-    }
-
-    let i = grabFromIndex;
-    while (i < dataSet.length - 1 && i - grabFromIndex + 1 < batchSize) {
-        i++;
-    }
-
-    if (i > dataSet.length - 1) {
-        // gone over. Select the end
-        i = dataSet.length - 1
-    }
-
-    return Date.parse(Hs.removePrefix(dataSet[i].ts));
-}
-
-/**
- * Find the time for which either the maximum number of time series rows are deleted or the batchSize of rows has been
- * reached.
- * @param timeRanges Array of Objects with property "endRange".
- * @param dataSet Data to search for the number of time series to be deleted from.
- * @param grabFrom Time stamp to grab from.
- * @param batchSize Maximum size of each batch.
- * @returns {{endRange, deleteRowCounts: number}} Return endRange to delete till and the number of rows to delete from
- *                                                each data set.
- */
-function getMinIndex(timeRanges, dataSet, grabFrom, batchSize) {
-    const sortByRange = timeRanges
-        .filter((range) => range !== null)
-        .sort((rangeA, rangeB) => {
-            if (rangeA < rangeB) {
-                return -1;
-            } else if (rangeA > rangeB) {
-                return 1;
-            } else {
-                return 0;
-            }
-        });
-
-    let curMax, endRange, deleteRowCounts;
-    for (let i = 0; i < sortByRange.length; i++) {
-        if (curMax === undefined) {
-            endRange = sortByRange[i];
-            deleteRowCounts = dataSet
-                .map((data) => rowsBetweenRange(data, grabFrom, sortByRange[i]));
-            curMax = Math.max(...deleteRowCounts);
-            if (curMax > batchSize) {
-                // this ain't it chief
-                curMax = undefined;
-                continue;
-            } else if (curMax === batchSize) {
-                // already at maximum batch size
-                break;
-            } else {
-                continue;
-            }
-        }
-
-        const getDataCount = dataSet.map((data) =>
-            rowsBetweenRange(data, grabFrom, sortByRange[i]));
-        const maxDataCount = Math.max(...getDataCount);
-        if (maxDataCount === batchSize) {
-            // we're at max
-            deleteRowCounts = getDataCount;
-            curMax = maxDataCount;
-            endRange = sortByRange[i];
-            break;
-        } else if (batchSize >= maxDataCount && maxDataCount > curMax ) {
-            deleteRowCounts = getDataCount;
-            curMax = maxDataCount;
-            endRange = sortByRange[i];
-        }
-    }
-
-    return { endRange, deleteRowCounts };
-}
-/**
- * Determine if all time series data has been accounted for.
- * @returns {boolean} True if there is more data to work with. False if not.
- */
-function allAccountedFor(data, recordIndexes) {
-    for (let i = 0; i < recordIndexes.length; i++) {
-        if (data[i].length > recordIndexes[i]) {
-            return false;
-        }
-    }
-
-    return true;
-}
-
-/**
- * Find the earliest time range in the historical data.
- * @param data Data to search within.
- * @returns {Date} Date of the earlier time series found.
- */
-function findStartTime(data) {
-    let startTime = null;
-    for (const dataSet of data) {
-        if (dataSet.length > 0) {
-            if (startTime === null) {
-                startTime = Date.parse(Hs.removePrefix(dataSet[0].ts));
-                continue;
-            }
-            const firstTime = Date.parse(Hs.removePrefix(dataSet[0].ts));
-            if (firstTime < startTime) {
-                startTime = firstTime;
-            }
-        }
-    }
-
-    return new Date(startTime);
-}
-
-/**
- * Create hisDelete time ranges to remove all the data given and append them to the given batch.
- * @param data Data to create time ranges for.
- * @param ids Entity IDs for who their data will be deleted.
- * @param batch The current batch to append hisDelete arguments to.
- * @param batchSize The maximum number of time series rows to be deleted per hisDelete range.
- * @param startTime The earliest time to be deleted.
- * @param timeEnd The requested end time range.
- */
-function createTimeRanges(data, ids, batch, batchSize, startTime, timeEnd) {
-    let grabFrom = startTime;
-    const recordIndexes = new Array(ids.length).fill(0);
-    while (!allAccountedFor(data, recordIndexes)) {
-        const timeRanges = recordIndexes.map((_, index) =>
-            endTimeRange(data[index], recordIndexes[index], batchSize));
-        const { endRange, deleteRowCounts} = getMinIndex(timeRanges, data, grabFrom.valueOf(), batchSize);
-        // ensure time range is inclusive of data to be deleted (i.e. +1ms)
-        const grabTo = new Date(endRange + 1);
-        if (grabTo.getTime() > timeEnd.getTime()) {
-            // end of the line
-            batch.push([ids, `s:${grabFrom.toISOString()},${timeEnd.toISOString()}`]);
-            break;
-        } else {
-            batch.push([ids, `s:${grabFrom.toISOString()},${grabTo.toISOString()}`]);
-        }
-
-        grabFrom = grabTo;
-
-        // update starting indexes
-        for (let i = 0; i < recordIndexes.length; i++) {
-            if (deleteRowCounts[i] !== 0) {
-                recordIndexes[i] += deleteRowCounts[i];
-            }
-        }
-    }
-}
-
-/**
- * Perform a history delete request using batch functionality. A hisRead will be performed for the ids and range given
- * to determine how the hisDelete ranges should be split to have at most options.batchSize time series rows deleted.
- * The option batchSizeEntity will also impact the number of entities involved when performing a hisRead operation.
- * @param ids An array of point entity UUIDs for the delete operations or a single string. These will be batched by
- *            options.batchSizeEntity.
- * @param timeStart Starting timestamp to be deleted as a Date Object.
- * @param timeEnd Ending timestamp to be deleted as a Date Object (not inclusive).
- * @param options An Object defining batch configurations to be used. See README.md for more information.
- *                Option batchSize is determined by the maximum number of time series rows to be deleted across
- *                all ids given.
- * @returns {Promise<{success: Array, errors: Array<{errors: String, args: Array}>}>}
- *          - success: Return the responses of hisDelete operations if options.returnResult is true.
- *          - errors: Return the errors encountered from hisDelete operations.
- */
-async function hisDelete(ids, timeStart, timeEnd, options={}) {
-    if (!(timeStart instanceof Date) || !(timeEnd instanceof Date)) {
-        throw new Error("parameter timeStart or timeEnd is not of type Date");
-    }
-
-    await BATCH_HIS_DELETE_SCHEMA.validate(options);
-    options = deriveFromDefaults(this.clientOptions.batch.hisDelete, options);
-    const { batchSize, batchSizeEntity } = options;
-
-    // Create batch of ids
-    let idsAsBatch = [];
-    if (ids.length > batchSizeEntity) {
-        const idsCopy = [...ids];
-        while (idsCopy.length) {
-            idsAsBatch.push(idsCopy.splice(0, batchSizeEntity));
-        }
+async function hisDelete(ids, range, endOrOptions, maybeOptions) {
+    let options;
+    if (typeof range === "string") {
+        options = endOrOptions || {};
+    } else if (range instanceof Date && endOrOptions instanceof Date) {
+        range = `s:${range.toISOString()},${endOrOptions.toISOString()}`;
+        options = maybeOptions || {};
     } else {
-        idsAsBatch.push(ids);
+        throw new Error("range must be a Haystack range string, or timeStart and timeEnd must both be Date objects");
+    }
+    ids = Array.isArray(ids) ? ids : [ids];
+    if (ids.length === 0) {
+        return { success: [], errors: [] };
     }
 
-    const errorsEncountered = [];
-    // Create time range batches in terms of each batch of ids
-    const batches = init2DArray(idsAsBatch.length);
-    for (let i = 0; i < idsAsBatch.length; i++) {
-        let idsInBatch = idsAsBatch[i];
-        let { success: data, errors } = await this.batch.hisRead(idsInBatch, timeStart, timeEnd);
-        if (errors.length) {
-            // pass the errors encountered to the user
-            for (const error of errors) {
-                errorsEncountered.push(error);
-            }
+    // null means "not supplied": drop it so the configured/default value applies instead of
+    // silently disabling bisection or retry.
+    options = lodash.omitBy(options, lodash.isNull);
+    await BATCH_HIS_DELETE_SCHEMA.validate(options);
+    const configured = lodash.get(this.options, "client.batch.hisDelete") || {};
+    const resolved = deriveFromDefaults(this.clientOptions.batch.hisDelete, { ...options });
+    this.logger.debug("batch.hisDelete options: %s", HIS_DELETE_OPTION_KEYS.map((k) => {
+        const source = options[k] !== undefined ? "call" : configured[k] !== undefined ? "client config" : "default";
+        return `${k}=${JSON.stringify(resolved[k])} (${source})`;
+    }).join(", "));
 
-            // purge the ids and data for which a hisRead could not be performed on
-            const newIds = [];
-            const newData = [];
-            for (let i = 0; i < data.length; i++) {
-                if (data[i].length !== 0) {
-                    newIds.push(idsInBatch[i]);
-                    newData.push(data[i]);
-                }
-            }
-            data = newData;
-            idsInBatch = newIds;
-        }
+    const { batchSizeEntity, maxBisectDepth, retries, retryDelay, returnResult } = resolved;
+    const parsed = parseRange(range);
+    const success = [];
+    const errors = [];
+    const requests = [];
 
-        if (idsInBatch.length === 0 || data.filter((dataSet) => dataSet.length > 0).length === 0) {
-            // no data to delete
+    for (const group of chunkIds(ids, batchSizeEntity)) {
+        if (!parsed.plannable) {
+            this.logger.debug("batch.hisDelete: range %s is not plannable; one request per group, no bisection", range);
+            requests.push(unplannedRequest(group, parsed.raw));
             continue;
         }
-
-        createTimeRanges(
-            data,
-            idsInBatch,
-            batches[i],
-            batchSize,
-            findStartTime(data),
-            timeEnd
-        );
-    }
-
-    if (batches.filter((idBatch) => idBatch.length > 0).length === 0) {
-        return {
-            success: [],
-            errors: errorsEncountered
-        };
-    }
-
-    const batchFlattened = [];
-    for (const idBatch of batches) {
-        for (const batchForIds of idBatch) {
-            batchFlattened.push(batchForIds);
+        let subGroups = [{ zone: "UTC", ids: group }];   // every end carries an offset: zone is irrelevant
+        if (parsed.tzLess) {
+            try {
+                subGroups = await groupByZone((groupIds) => this.read(groupIds), group);
+            } catch (error) {
+                errors.push({ error: error.message, args: ["countQuery", group, range] });
+                continue;
+            }
+        }
+        for (const sub of subGroups) {
+            if (sub.zone === null) {
+                this.logger.warn("batch.hisDelete: no usable tz on %s; planning %s with a 14 h margin",
+                    sub.ids.join(","), range);
+            }
+            const countFn = async (fromMs, toMs, unit) =>
+                parseCountResponse(await this.query(buildCountQuery(sub.ids, fromMs, toMs, unit)), unit);
+            try {
+                requests.push(...(await planGroup(countFn, sub.ids, parsed, windowFor(parsed, sub.zone), resolved)));
+            } catch (error) {
+                errors.push({ error: error.message, args: ["countQuery", sub.ids, range] });
+            }
         }
     }
 
-    const opResult = await this.performOpInBatch(
-        "hisDelete",
-        [batchFlattened],
-        {
-            ...options,
-            batchSize: 1,           // batches are based on the time ranges to be deleted
-            transformer: (batch) => batch[0]
+    const runRequest = async (req) => {
+        try {
+            const res = await withRetry(() => this.hisDelete(req.ids, req.range), { retries, retryDelay });
+            if (returnResult) {
+                success.push(res);
+            }
+        } catch (error) {
+            const halves = isRecordLimitError(error) && req.depth < maxBisectDepth ? splitRequest(req) : null;
+            if (halves) {
+                this.logger.warn("batch.hisDelete: record limit hit for %s; bisecting (depth %d/%d)",
+                    req.range, req.depth + 1, maxBisectDepth);
+                for (const half of halves) {
+                    await runRequest(half);
+                }
+                return;
+            }
+            errors.push({ error: error.message, args: ["hisDelete", req.ids, req.range] });
         }
-    );
-
-    // join the result with any errors encountered
-    return {
-        success: opResult.success,
-        errors: [...errorsEncountered, ...opResult.errors]
     };
+
+    // The engine only paces and parallelises here; runRequest records its own results so that
+    // bisected halves and original errors are kept. The receiver is a stand-in so the dispatch
+    // name never lands on the shared client instance.
+    const runner = Object.create(this);
+    runner.runHisDeleteRequest = runRequest;
+    await this.performOpInBatch.call(runner, "runHisDeleteRequest", [[...requests]], {
+        batchSize: 1,
+        transformer: (batch) => batch[0],
+        parallel: resolved.parallel,
+        batchDelay: resolved.batchDelay,
+        parallelDelay: resolved.parallelDelay,
+        returnResult: false
+    });
+
+    return { success, errors };
 }
 
 /**
