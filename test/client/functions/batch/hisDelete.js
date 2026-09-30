@@ -333,9 +333,31 @@ describe("client.batch.hisDelete", () => {
                 expect(() => parseRange(`s:${ok}`), ok).to.not.throw();
             }
             for (const bad of ["2026-09-01T00:00:00Z,2026-09-02", "2026-09-01T00:00:00Z,2026-09-02T00:00:00+10:00 Brisbane",
-                "2026-09-01T00:00:00+10:00,2026-09-02T00:00:00+10:00", "2026-09-01T00:00:00,2026-09-02T00:00:00"]) {
+                "2026-09-01T00:00:00+10:00,2026-09-02T00:00:00+10:00", "2026-09-01T00:00:00,2026-09-02T00:00:00",
+                "2026-09-01T00:00Z,2026-09-02T00:00Z", "2026-09-01T00:00+10:00 Brisbane,2026-09-02T00:00+10:00 Brisbane"]) {
                 expect(() => parseRange(`s:${bad}`), bad).to.throw();
             }
+        });
+
+        it("the fake reads datetime ends as the API server does", () => {
+            const { parseRange } = require("./fakeHistoryServer");
+            const at = (r) => { const { start, end } = parseRange(`s:${r}`); return [start.ms, end.ms]; };
+            // Whole-hour offsets and "Z" / "UTC" are read as ISO 8601 instants.
+            expect(at("2026-06-01T00:00:00+10:00 Brisbane,2026-06-02T00:00:00.500+10:00 Brisbane"))
+                .to.eql([t("2026-05-31T14:00:00Z"), t("2026-06-01T14:00:00.500Z")]);
+            expect(at("2026-06-01T00:00:00-04:00 New_York,2026-06-02T00:00:00-04:00 New_York"))
+                .to.eql([t("2026-06-01T04:00:00Z"), t("2026-06-02T04:00:00Z")]);
+            expect(at("2026-06-01T00:00:00Z,2026-06-02T00:00:00+00:00 UTC")).to.eql([t("2026-06-01T00:00:00Z"), t("2026-06-02T00:00:00Z")]);
+            // A non-zero offset with minutes is applied as hours*60 + minutes*60 minutes: +09:30 -> +39:00.
+            expect(at("2026-06-01T00:00:00+09:30 Adelaide,2026-06-02T00:00:00+09:30 Adelaide"))
+                .to.eql([t("2026-06-01T00:00:00Z") - 39 * HOUR, t("2026-06-02T00:00:00Z") - 39 * HOUR]);
+            expect(at("2026-06-01T00:00:00-02:30 St_Johns,2026-06-02T00:00:00-02:30 St_Johns"))
+                .to.eql([t("2026-06-01T00:00:00Z") + 32 * HOUR, t("2026-06-02T00:00:00Z") + 32 * HOUR]);
+            // A zero offset with a zone name is read as wall time in that zone.
+            expect(at("2026-06-01T00:00:00+00:00 Adelaide,2026-06-02T00:00:00Z Adelaide"))
+                .to.eql([t("2026-05-31T14:30:00Z"), t("2026-06-01T14:30:00Z")]);
+            expect(at("2026-09-01T00:00:00Z London,2026-09-02T00:00:00+00:00 London"))
+                .to.eql([t("2026-08-31T23:00:00Z"), t("2026-09-01T23:00:00Z")]);
         });
     });
 

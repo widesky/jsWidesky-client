@@ -3,10 +3,12 @@
 const sinon = require("sinon");
 const moment = require("moment-timezone");
 
+const MIN_MS = 60000;
 const UNIT_MS = { WEEK: 604800000, DAY: 86400000, HOUR: 3600000, MINUTE: 60000, SECOND: 1000 };
 const DATE_ONLY_RE = /^\d{4}-\d{2}-\d{2}$/;
-// Zinc datetime: offset "Z" or "+hh:mm" (colon required), then an optional " TzName".
-const DATETIME_RE = /^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?)(Z|[+-]\d{2}:\d{2})?(?: (\S+))?$/;
+// Zinc datetime: hh:mm then seconds (mandatory), optional fraction, offset "Z" or "+hh:mm"
+// (colon required), then an optional " TzName".
+const DATETIME_RE = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})(?::(\d{2})(?:\.(\d*))?)?(Z|[+-]\d{2}:\d{2})?(?: (\S+))?$/;
 const UUID_RE = "[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}";
 const COUNT_FILTER_RE = new RegExp(`^id==@${UUID_RE}(?: or id==@${UUID_RE})*$`);
 
@@ -32,19 +34,44 @@ function networkError(code) {
 
 /**
  * Parse one end of a hisDelete range the way the API server's HZincReader does
- * (widesky-api-server widesky/externals/haystack/io/HZincReader.js): a date, or a datetime whose
- * offset is "Z" (tz UTC unless a name follows) or "+hh:mm" that MUST be followed by a tz name.
- * Throws the server's message for anything else.
+ * (widesky-api-server widesky/externals/haystack/io/HZincReader.js): a date, or a datetime with
+ * seconds whose offset is "Z" (tz UTC unless a name follows) or "+hh:mm" that MUST be followed by
+ * a tz name. Throws the server's message for anything else.
+ *
+ * The instant is resolved as the server resolves it (read.js -> timezoneSvc.timezoneEpoch), not
+ * as ISO 8601 would:
+ *   - a non-zero offset is applied as tzHours*60 + tzMins*60 MINUTES (HZincReader's arithmetic),
+ *     so "+10:00" is right but "+09:30" is read as +39:00;
+ *   - a zero offset ("Z" or "+00:00") is not applied at all: the wall time is read in the named
+ *     zone ("Z" alone and "... UTC" are UTC).
  */
 function parseEnd(token) {
     const tok = token.trim();
     if (DATE_ONLY_RE.test(tok)) return { kind: "date", iso: tok };
     const m = tok.match(DATETIME_RE);
     if (!m) throw haystackError(400, `Invalid HDateTimeRange: ${tok}`);
-    const [, local, offset, name] = m;
+    const [, y, mo, d, h, mi, sec, frac, offset, name] = m;
+    if (sec === undefined) {
+        const next = tok.charAt(16);
+        throw haystackError(400, next
+            ? `Expected ':' for time value (char=0x${next.charCodeAt(0).toString(16)} '${next}')`
+            : "Expected ':' for time value (end of stream)");
+    }
     if (!offset) throw haystackError(400, "Expected -/+ for timezone offset");
     if (offset !== "Z" && !name) throw haystackError(400, "Expected space between timezone offset and name");
-    return { kind: "datetime", ms: Date.parse(local + offset), tz: name || "UTC" };
+    const tz = name || "UTC";
+    const ms = frac ? Math.round(Number(`0.${frac}`) * 1000) : 0;
+    const wall = Date.UTC(Number(y), Number(mo) - 1, Number(d), Number(h), Number(mi), Number(sec), ms);
+    let offsetMin = 0;
+    if (offset !== "Z") {
+        const [hh, mm] = offset.slice(1).split(":").map(Number);
+        offsetMin = (hh * 60 + mm * 60) * (offset[0] === "-" ? -1 : 1);
+    }
+    if (offsetMin !== 0) return { kind: "datetime", ms: wall - offsetMin * MIN_MS, tz };
+    const zone = iana(tz);
+    if (!zone) throw haystackError(400, `Unknown timezone: ${tz}`);
+    const local = new Date(wall).toISOString().slice(0, 23);
+    return { kind: "datetime", ms: moment.tz(local, "YYYY-MM-DDTHH:mm:ss.SSS", zone).valueOf(), tz };
 }
 
 /**
@@ -69,10 +96,11 @@ function parseRange(range) {
  * It stores rows per point, answers the planner's GraphQL COUNT histograms from them and applies
  * hisDelete requests to them, so tests assert on what was deleted rather than on how.
  *
- * Range grammar is the API server's: two dates, or two datetimes with an offset and the same tz
- * name ("Z" alone means UTC); mixed forms, differing names, an offset without a name and a
- * datetime without an offset are rejected with a 400, so tests cannot pin forms the server
- * refuses. A date-only end includes that whole day in the point's timezone; `today` /
+ * Range grammar is the API server's: two dates, or two datetimes with seconds, an offset and
+ * the same tz name ("Z" alone means UTC); mixed forms, differing names, an offset without a
+ * name, a datetime without an offset and a datetime without seconds are rejected with a 400, so
+ * tests cannot pin forms the server refuses. Datetime ends resolve to the instant the server
+ * reads (see parseEnd), including its misreading of offsets with non-zero minutes. A date-only end includes that whole day in the point's timezone; `today` /
  * `yesterday` resolve in the point's timezone against `now`; start inclusive, end exclusive.
  * The count query's filter must be `id==@<uuid>` terms joined by " or ", or the response is a
  * GraphQL error. test/integration/hisDelete-e2e.js checks the real server against a plain
