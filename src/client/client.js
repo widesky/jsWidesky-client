@@ -242,6 +242,8 @@ class WideSkyClient {
         this.logger = initLogger(logger);
         this.options = options;
         this.clientOptions = null;
+        // Capabilities callers can feature-detect without reading package metadata.
+        this.features = Object.freeze({ hisDeletePlanner: true });
         this._impersonate = null;
         this._impersonatePendingEmail = null;
         this._impersonateLookup = null;
