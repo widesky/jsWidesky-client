@@ -9,7 +9,8 @@
  * Oracle test for batch.hisDelete (CORE-9209) against a LIVE apiserver stack.
  *
  * Every scenario seeds two identical point sets, X and Y. X is deleted with batch.hisDelete;
- * Y with ONE plain client.hisDelete of the same range, which is the server's own semantics.
+ * Y with plain client.hisDelete of the same range (one call per timezone group), which is the
+ * server's own semantics.
  * Every point's in-range rows are <= 1500, so the plain call cannot hit the server's per-entity
  * limit. Surviving rows must match exactly, including rows 1 ms either side of the range.
  * Points get a per-run suffix, so nothing is wiped; the site and equip are reused.
@@ -31,6 +32,7 @@ const EQUIP = `${SITE}.plantroom`;
 const RUN_ID = Date.now().toString(36);
 const LIMIT_MESSAGE = "data points per entity cannot exceed";
 const BATCH_SIZE_ENTITY = 10; // client default
+const BUG_4_IDS = "server bug: a hisDelete naming exactly 4 ids skips the 4th, see CORE-9209 D1 evidence";
 
 const UTC_RANGE = "2026-06-01T00:00:00Z,2026-06-04T00:00:00Z";
 const OFFSET_RANGE = "2026-06-01T00:00:00+10:00 Brisbane,2026-06-04T00:00:00+10:00 Brisbane";
@@ -101,14 +103,19 @@ const TZLESS_ZONES = ["Brisbane", "New_York", "Adelaide"];
 function tzlessBuild() {
     const zoneOf = (i) => TZLESS_ZONES[i % TZLESS_ZONES.length];
     return () => ({
-        targets: Array.from({ length: 12 }, (_, i) => ({ name: `point_${i}`, tz: zoneOf(i), data: H.buildTzlessData(zoneOf(i)) })),
+        // 15 targets, 5 per zone, run with batchSizeEntity 15: every X tz sub-group and every Y
+        // per-zone group names 5 ids, never 4
+        // (server bug: a hisDelete naming exactly 4 ids skips the 4th, see CORE-9209 D1 evidence).
+        targets: Array.from({ length: 15 }, (_, i) => ({ name: `point_${i}`, tz: zoneOf(i), data: H.buildTzlessData(zoneOf(i)) })),
         controls: TZLESS_ZONES.map((zone, i) => ({ name: `control_${i + 1}`, tz: zone, data: H.buildTzlessData(zone) })),
     });
 }
 
 function yesterdayBuild() {
     return (nowMs) => ({
-        targets: Array.from({ length: 4 }, (_, i) => ({ name: `point_${i}`, tz: "Brisbane", data: H.buildYesterdayData("Brisbane", nowMs) })),
+        // 5 targets: one unplanned request naming 4 ids would trip
+        // (server bug: a hisDelete naming exactly 4 ids skips the 4th, see CORE-9209 D1 evidence).
+        targets: Array.from({ length: 5 }, (_, i) => ({ name: `point_${i}`, tz: "Brisbane", data: H.buildYesterdayData("Brisbane", nowMs) })),
         controls: [1, 2].map((i) => ({ name: `control_${i}`, tz: "Brisbane", data: H.buildYesterdayData("Brisbane", nowMs) })),
     });
 }
@@ -174,8 +181,16 @@ function yesterdayBuild() {
             };
 
             const res = await ws.batch.hisDelete(Object.values(X), range, opts);
-            ws._wsRawSubmit = raw; // the oracle call is not part of the recording
-            await ws.hisDelete(Object.values(Y), range.startsWith("s:") ? range : `s:${range}`);
+            ws._wsRawSubmit = raw; // the oracle calls are not part of the recording
+
+            // Oracle: ONE plain hisDelete PER TIMEZONE GROUP of Y points, not one over all of them
+            // (server bug: mixed-timezone date-only delete, see CORE-9209 D1 evidence).
+            const yGroups = {};
+            for (const id of Object.values(Y)) (yGroups[tzOf[id]] = yGroups[tzOf[id]] || []).push(id);
+            const yRequestSizes = Object.values(yGroups).map((g) => g.length);
+            for (const group of Object.values(yGroups)) {
+                await ws.hisDelete(group, range.startsWith("s:") ? range : `s:${range}`);
+            }
 
             // Only now-dependent ranges can drift; check before any assertion, in the scenario's zone.
             if (H.isNowDependent(range)) {
@@ -186,6 +201,10 @@ function yesterdayBuild() {
             }
 
             const deletes = seen.filter((s) => s.uri === "/api/hisDelete");
+            // Guard: no X or Y request may name exactly 4 ids (server bug: a hisDelete naming exactly 4 ids skips the 4th, see CORE-9209 D1 evidence).
+            const requestSizes = [...deletes.map((d) => H.idsOfBody(d.body).length), ...yRequestSizes];
+            expect(requestSizes.filter((n) => n === 4).length,
+                `${label}: a delete request named exactly 4 ids; the ${BUG_4_IDS}. Sizes: ${JSON.stringify(requestSizes)}`).to.equal(0);
             if (expectRejection) {
                 const rejections = deletes.filter((d) => !d.ok && d.message.includes(LIMIT_MESSAGE));
                 expect(rejections.length, `${label}: >= 1 record-limit rejection (${JSON.stringify(deletes.map((d) => d.message))})`).to.be.at.least(1);
@@ -217,7 +236,7 @@ function yesterdayBuild() {
             expect(ok.length, `${label}: >= 1 successful delete request`).to.be.at.least(1);
             for (const d of deletes) {
                 const ids = H.idsOfBody(d.body);
-                expect(ids.length, `${label}: ids per delete request`).to.be.at.most(BATCH_SIZE_ENTITY);
+                expect(ids.length, `${label}: ids per delete request`).to.be.at.most(opts.batchSizeEntity || BATCH_SIZE_ENTITY);
             }
             const maxRows = H.maxRowsPerRequest(ok.map((d) => d.body), snapshots, tzOf, nowMs);
             // +1: one row may sit on a boundary shared by two adjacent windows.
@@ -234,6 +253,8 @@ function yesterdayBuild() {
 
     it("tz-less date range (mixed points)", () => scenario({
         label: "tzl", range: TZLESS_RANGE, tz: "Brisbane", build: tzlessBuild(),
+        // 15 so each tz sub-group of X is 5 ids (server bug: a hisDelete naming exactly 4 ids skips the 4th, see CORE-9209 D1 evidence).
+        options: { batchSizeEntity: 15 },
     }));
 
     it("end-inclusive date pair with offsets", () => scenario({
