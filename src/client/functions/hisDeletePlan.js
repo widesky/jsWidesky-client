@@ -9,9 +9,11 @@ const UNIT_MS = Object.freeze({
 });
 
 const DATE_ONLY_RE = /^\d{4}-\d{2}-\d{2}$/;
-// A Zinc datetime as the API server reads it: offset "Z" or "+hh:mm" (colon required), then an
-// optional " TzName". The server requires the name after "+hh:mm"; "Z" alone means UTC.
-const DATETIME_RE = /^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?)(Z|[+-]\d{2}:\d{2})(?: (\S+))?$/;
+// A Zinc datetime as the API server reads it: seconds are mandatory ("Expected ':' for time
+// value"), then offset "Z" or "+hh:mm" (colon required), then an optional " TzName". The server
+// requires the name after "+hh:mm"; "Z" alone means UTC.
+const DATETIME_RE = /^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?)(Z|[+-]\d{2}:\d{2})(?: (\S+))?$/;
+const ZERO_OFFSET_RE = /^(Z|[+-]00:00)$/;
 const ZONED_FORMAT = "YYYY-MM-DDTHH:mm:ss.SSSZ";
 const WALL_FORMAT = "YYYY-MM-DDTHH:mm:ss.SSS";
 const HOUR_MS = 3600000;
@@ -103,7 +105,17 @@ function parseEnd(token) {
     const parsed = moment.parseZone(local + offset, moment.ISO_8601, true);
     if (!parsed.isValid()) return null;
     if (offset === "Z" && (!name || name === "UTC")) return { kind: "zulu", tok, ms: parsed.valueOf(), tzName: "UTC" };
-    return name ? { kind: "named", tok, ms: parsed.valueOf(), tzName: name } : null;
+    if (!name) return null;
+    // The server applies no zero offset, reading the wall time in the named zone
+    // (timezoneSvc.timezoneEpoch). "Z <Name>" is left to the server; "+00:00 <Name>" is planned
+    // only where that wall time is exactly the ISO instant (the zone is at UTC+0 then, outside a
+    // repeated DST hour).
+    if (ZERO_OFFSET_RE.test(offset) && name !== "UTC") {
+        const iana = offset === "Z" ? null : ianaZone(name);
+        const zone = iana && moment.tz.zone(iana);
+        if (!zone || zone.utcOffset(parsed.valueOf()) !== 0 || isAmbiguousWall(zone, parsed.valueOf())) return null;
+    }
+    return { kind: "named", tok, ms: parsed.valueOf(), tzName: name };
 }
 
 /**
@@ -115,8 +127,9 @@ function parseEnd(token) {
  *   "date"  both ends dates: per timezone sub-group, both ends become local-midnight datetimes
  *           (the end is the day after the end date) with the point's tz name (see windowFor).
  * Anything else (relative keywords, one value, mixed forms, an offset without a name, a datetime
- * without an offset, two different names, an empty or inverted range) is not plannable: the
- * caller's range is sent verbatim, one request per group, and the server decides.
+ * without an offset or without seconds, "Z <Name>" for a zone other than UTC, "+00:00 <Name>"
+ * where that zone is not at UTC+0, two different names, an empty or inverted range) is not
+ * plannable: the caller's range is sent verbatim, one request per group, and the server decides.
  */
 function parseRange(range) {
     const raw = range.startsWith("s:") ? range.slice(2) : range;

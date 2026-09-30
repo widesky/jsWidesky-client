@@ -401,7 +401,10 @@ describe("client.batch.hisDelete", () => {
             ["2026-09-01,2026-09-04T00:00:00Z", "Invalid HDateTimeRange: 2026-09-01,2026-09-04T00:00:00Z"],
             ["2026-09-01T00:00:00+10:00,2026-09-04T00:00:00+10:00", "Expected space between timezone offset and name"],
             ["2026-09-01T00:00:00,2026-09-04T00:00:00", "Expected -/+ for timezone offset"],
-            ["2026-09-01T00:00:00+10:00 Brisbane,2026-09-04T00:00:00+10:00 Sydney", "arg1.tz != arg2.tz"]
+            ["2026-09-01T00:00:00+10:00 Brisbane,2026-09-04T00:00:00+10:00 Sydney", "arg1.tz != arg2.tz"],
+            // The server requires seconds in a datetime.
+            ["2026-09-01T00:00Z,2026-09-04T00:00Z", "Expected ':' for time value (char=0x5a 'Z')"],
+            ["2026-09-01T00:00+10:00 Brisbane,2026-09-04T00:00+10:00 Brisbane", "Expected ':' for time value (char=0x2b '+')"]
         ]) {
             it(`sends ${range} as one unplanned request`, async () => {
                 const { ws, fake } = client({ [PT.chwFlowTemp]: { tz: "Brisbane", rows: every("2026-09-01T00:00:00Z", 3 * 1440, MIN) } });
@@ -409,6 +412,39 @@ describe("client.batch.hisDelete", () => {
                 expect(counts(fake)).to.eql([]);
                 expect(deletes(fake).map((r) => r.range)).to.eql([`s:${range}`]);
                 expect(res.errors).to.eql([{ error, args: ["hisDelete", [PT.chwFlowTemp], `s:${range}`] }]);
+            });
+        }
+
+        // The server ignores a zero offset and reads the wall time in the named zone, so these
+        // name an instant other than the ISO one whenever the zone is not at UTC+0 then.
+        for (const [range, fromWall, toWall] of [
+            ["2026-09-01T00:00:00Z London,2026-09-04T00:00:00Z London", "Europe/London"],
+            ["2026-09-01T00:00:00+00:00 New_York,2026-09-04T00:00:00+00:00 New_York", "America/New_York"]
+        ].map(([r, z]) => [r, moment.tz("2026-09-01", z).valueOf(), moment.tz("2026-09-04", z).valueOf()])) {
+            it(`sends ${range} as one unplanned request, and the server's reading decides`, async () => {
+                const rows = [fromWall - 1, ...every(new Date(fromWall).toISOString(), 3 * 1440, MIN), toWall];
+                const { ws, fake } = client({ [PT.chwFlowTemp]: { tz: "Brisbane", rows } }, { recordLimit: 5000 });
+                const res = await ws.batch.hisDelete([PT.chwFlowTemp], range);
+                expect(res.errors).to.eql([]);
+                expect(counts(fake)).to.eql([]);
+                expect(deletes(fake).map((r) => r.range)).to.eql([`s:${range}`]);
+                expect(fake.rows(PT.chwFlowTemp)).to.eql([fromWall - 1, toWall]);
+            });
+        }
+
+        for (const range of ["2026-09-01T00:00:00Z UTC,2026-09-04T00:00:00Z UTC",
+            "2026-09-01T00:00:00+00:00 UTC,2026-09-04T00:00:00+00:00 UTC",
+            // London is at UTC+0 in January, so its wall time is the ISO instant.
+            "2026-01-05T00:00:00+00:00 London,2026-01-08T00:00:00+00:00 London"]) {
+            it(`still plans ${range}`, async () => {
+                const from = Date.parse(range.slice(0, 19) + "Z"), to = from + 3 * DAY;
+                const rows = [from - 1, ...every(new Date(from).toISOString(), 3 * 1440, MIN), to];
+                const { ws, fake } = client({ [PT.chwFlowTemp]: { tz: "Brisbane", rows } });
+                const res = await ws.batch.hisDelete([PT.chwFlowTemp], range);
+                expect(res.errors).to.eql([]);
+                expect(deletes(fake).length).to.be.greaterThan(1);
+                expect(Math.max(...deletes(fake).map((r) => r.deleted[0]))).to.be.at.most(500);
+                expect(fake.rows(PT.chwFlowTemp)).to.eql([from - 1, to]);
             });
         }
 
