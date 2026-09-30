@@ -4,6 +4,14 @@ This project adheres to [Semantic Versioning](http://semver.org/).
 
 ## [Unreleased]
 
+### Added
+- [CORE-9209](https://widesky.atlassian.net/browse/CORE-9209): `batch.hisDelete` options `maxBisectDepth`, `countBucketUnits`, `retries` and `retryDelay`, and `client.features.hisDeletePlanner` for feature detection.
+
+### Changed
+- [CORE-9209](https://widesky.atlassian.net/browse/CORE-9209): `batch.hisDelete` sizes deletes from server-side record counts instead of reading every row first, and accepts a Haystack range string as well as two Dates.
+  - Default request size lowered to 500 rows per point and 10 points per request (was 1500 / 100).
+  - Requests rejected for the per-point record limit are halved and retried, up to `maxBisectDepth` times.
+
 ## [3.5.0] - 2026-08-13
 
 ### Added

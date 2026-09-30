@@ -825,22 +825,22 @@ requests.
 - `errors`: Contain an errors encountered when performing operations.
 
 ### WideSkyClient.batch.hisDelete(ids, start, end, options)
-**Description:** Perform a history delete request using batch functionality. A hisRead will be performed for the ids
-and range given to determine how the hisDelete ranges should be split to have at most options.batchSize time series
-rows deleted. The option batchSizeEntity will also impact the number of entities involved when performing a hisRead
-operation.  
+**Description:** Perform a history delete request using batch functionality. Row counts are requested from the server
+and used to split the range into requests of at most `options.batchSize` rows per entity, without reading any history.
+The range may also be given as a single Haystack range string: `WideSkyClient.batch.hisDelete(ids, range, options)`.
+See [batch.md](batch.md#path-clientbatchhisdelete) for how the range is planned, retried and reported.  
 **Parameters:**
 
-| Param     | Description                                                                                                                                                                                          |  Type  | Default |
-|-----------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|:------:|:-------:|
-| `ids`     | An array of point entity UUIDs for the delete operations or a single string. These will be batched by options.batchSizeEntity.                                                                       | Array  |         |
-| `start`   | Starting timestamp to be deleted as a Date Object.                                                                                                                                                   |  Date  |         |
-| `end`     | Ending timestamp to be deleted as a Data Object (not inclusive).                                                                                                                                     |  Date  |         |
-| `options` | An Object defining batch configurations to be used. See README.md for more information. Option batchSize is determined by the maximum number of time series rows to be deleted across all ids given. | Object |  `{}`   |
+| Param     | Description                                                                                                                                                       |      Type      | Default |
+|-----------|-------------------------------------------------------------------------------------------------------------------------------------------------------------------|:--------------:|:-------:|
+| `ids`     | An array of point entity UUIDs for the delete operations or a single string. These will be batched by options.batchSizeEntity.                                    |     Array      |         |
+| `start`   | Starting timestamp to be deleted as a Date Object. Pass a Haystack range string here instead to use the range form, in which `options` follows directly after it.                                | Date or String |         |
+| `end`     | Ending timestamp to be deleted as a Date Object (not inclusive).                                                                                                  |      Date      |         |
+| `options` | An Object defining batch configurations to be used. See batch.md for more information. Option batchSize is the maximum number of rows deleted per entity per request. |     Object     |  `{}`   |
 
-**Returns:** `Promise<{success: Array, errors: Array<{errors: String, args: Array}>}>`
+**Returns:** `Promise<{success: Array, errors: Array<{error: String, args: Array}>}>`
 - `success`: Return the responses of hisDelete operations if `options.returnResult` is `true`.
-- `errors`: Return the errors encountered from hisDelete operations.
+- `errors`: Return the errors encountered from hisDelete operations. `args[0]` is `"hisDelete"` or `"countQuery"`.
 
 ### WideSkyClient.batch.create(entities, options)
 **Description:** Perform a create request using batch functionality. The request are batched based on the number of

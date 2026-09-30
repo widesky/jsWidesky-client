@@ -61,16 +61,82 @@ The Object in `client.batch.hisWrite` is expected to have the following structur
 | `returnResult`                    | Enable the result from WideSky API server operation `hisWrite` to be returned | Boolean | `false` |
 
 ### Path `client.batch.hisDelete`
+`client.batch.hisDelete` deletes history by asking the server how many rows each point holds, then splitting the range
+into requests that stay under the server's per-point record limit. It never reads the history itself.
+
+It can be called with either a Haystack range string or two Dates:
+
+```js
+client.batch.hisDelete(ids, range, options);           // e.g. "2026-09-01,2026-09-03" or "yesterday"
+client.batch.hisDelete(ids, start, end, options);      // Date, Date (end not inclusive)
+```
+
+`range` accepts the same strings as `client.hisDelete`, with or without the `s:` prefix. Support can be detected with
+`client.features.hisDeletePlanner === true`.
+
 The Object in `client.batch.hisDelete` is expected to have the following structure:
 
-| Path from `client.batch.hisDelete` | Description                                                                                                         |  Type   | Default |
-|------------------------------------|---------------------------------------------------------------------------------------------------------------------|:-------:|:-------:|
-| `batchSize`                        | Define the maximum number of time series data to be deleted across all entities in a single `hisDelete` operations. | Number  |  1500   |
-| `batchSizeEntity`                  | Define the maximum number of entities to perform a `hisDelete` operation on.                                        | Number  |   100   |
-| `batchDelay`                       | Define the time in between each batch `hisDelete` request (ms).                                                     | Number  |    0    |
-| `parallel`                         | Define the number of batched requests to be run in parallel                                                         | Number  |    1    |
-| `parallelDelay`                    | Define the delay between each set of batched requests run in parallel (ms)                                          | Number  |    0    |
-| `returnResult`                     | Enable the result from WideSky API server operation `hisDelete` to be returned                                      | Boolean | `false` |
+| Path from `client.batch.hisDelete` | Description                                                                                                                                                             |  Type   |            Default             |
+|------------------------------------|-------------------------------------------------------------------------------------------------------------------------------------------------------------------------|:-------:|:------------------------------:|
+| `batchSize`                        | Define the maximum number of rows to be deleted per entity in a single `hisDelete` request. Between 1 and 3000.                                                         | Number  |              500               |
+| `batchSizeEntity`                  | Define the maximum number of entities in a single `hisDelete` request. Between 1 and 1000.                                                                              | Number  |               10               |
+| `maxBisectDepth`                   | Define how many times a request rejected for exceeding the record limit may be halved and retried. `0` reports the request as an error instead. Between 0 and 10.       | Number  |               5                |
+| `countBucketUnits`                 | Define the time units used to count rows, from coarsest to finest. Must be a non-empty list of GraphQL `duration` values, coarse to fine, without duplicates.           |  Array  | `["DAY", "HOUR", "MINUTE"]`    |
+| `retries`                          | Define how many times a request is retried after a retryable failure (see below). `0` disables retrying. Between 0 and 10.                                              | Number  |               0                |
+| `retryDelay`                       | Define the time to wait before each retry (ms). `0` means no delay.                                                                                                     | Number  |              2000              |
+| `batchDelay`                       | Define the time in between each batch `hisDelete` request (ms).                                                                                                         | Number  |               0                |
+| `parallel`                         | Define the number of batched requests to be run in parallel                                                                                                             | Number  |               1                |
+| `parallelDelay`                    | Define the delay between each set of batched requests run in parallel (ms)                                                                                              | Number  |               0                |
+| `returnResult`                     | Enable the result from WideSky API server operation `hisDelete` to be returned                                                                                          | Boolean |            `false`              |
+
+Older versions used a `batchSize` of 1500 rows counted across all entities and a `batchSizeEntity` of 100. Both
+defaults are now lower and `batchSize` is counted per entity, so a caller that relied on the old defaults will send more,
+smaller requests.
+
+At debug level the client logs every resolved option once per call, together with whether its value came from the call,
+the client configuration or the default. A call option of `null` counts as not supplied.
+
+#### How the range is planned
+Ids are split into groups of `batchSizeEntity`, in the order given, and each group is planned on its own.
+
+1. A range that is not a plain absolute range (for example `today`, `yesterday`, a single date or something that cannot
+   be parsed) is not planned. It is sent as one request per group, exactly as given, and cannot be halved. Such ranges
+   are at most a day long.
+2. The server is asked for row counts over the range, in buckets of the first unit in `countBucketUnits`. A bucket
+   counts as the highest row count of any entity in the group, since the server's limit applies per entity.
+3. Any bucket above `batchSize` is counted again in the next finer unit. A bucket still above `batchSize` at the finest
+   unit is split into equal slices.
+4. Buckets are packed oldest first into requests that keep each entity at or below `batchSize` rows.
+5. The requests are contiguous and together cover the whole range, so rows written while the delete is running still
+   fall inside a request.
+6. The first request starts with the start you gave and the last one ends with the end you gave, unchanged, so the range
+   is interpreted by the server exactly as for a single `client.hisDelete`.
+7. A group with no rows at all still gets one request for the whole range.
+
+If either end of the range has no timezone offset, the server reads it in each point's own timezone. The client reads
+the group's points once and plans each timezone separately. A point with no timezone, or one the client cannot map to a
+known timezone, is planned with a 14 hour margin at each such end: the first and last requests for that point may then
+hold more than `batchSize` rows, and a warning is logged.
+
+#### Failures and retries
+All planned requests are attempted. Failures do not stop the others; they are collected in `errors`, and requests that
+succeeded are kept in `success` when `returnResult` is `true`. Each error has the form `{ error: String, args: Array }`,
+and `args[0]` tells the two kinds apart:
+
+| `args[0]`      | Meaning                                                                                                             | `args`                        |
+|----------------|---------------------------------------------------------------------------------------------------------------------|-------------------------------|
+| `"hisDelete"`  | A delete request failed. Nothing further is done for that request.                                                  | `["hisDelete", ids, range]`   |
+| `"countQuery"` | Counting (or reading timezones) for a group failed. The group is skipped and nothing is deleted for its entities.   | `["countQuery", ids, range]`  |
+
+A request rejected because it exceeds the per-entity record limit ("data points per entity cannot exceed") is halved
+and both halves are sent, up to `maxBisectDepth` times. A request is retried up to `retries` times, waiting `retryDelay`
+between attempts, only for these failures:
+- HTTP status 500, 502, 503 or 504.
+- Network error codes `ENETDOWN`, `ENETUNREACH`, `ECONNABORTED`, `ECONNRESET`, `ETIMEDOUT`, `ECONNREFUSED`, `EHOSTDOWN`
+  or `EHOSTUNREACH`.
+
+Any other failure is not retried, including HTTP 429 and other 4xx statuses. A record-limit error is halved rather than
+retried, whatever its status.
 
 ### Path `client.batch.create`
 The Object in `client.batch.create` is expected to have the following structure:
