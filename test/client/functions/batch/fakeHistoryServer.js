@@ -4,8 +4,11 @@ const sinon = require("sinon");
 const moment = require("moment-timezone");
 
 const UNIT_MS = { WEEK: 604800000, DAY: 86400000, HOUR: 3600000, MINUTE: 60000, SECOND: 1000 };
-const OFFSET_RE = /(Z|[+-]\d{2}:?\d{2})$/i;
 const DATE_ONLY_RE = /^\d{4}-\d{2}-\d{2}$/;
+// Zinc datetime: offset "Z" or "+hh:mm" (colon required), then an optional " TzName".
+const DATETIME_RE = /^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?)(Z|[+-]\d{2}:\d{2})?(?: (\S+))?$/;
+const UUID_RE = "[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}";
+const COUNT_FILTER_RE = new RegExp(`^id==@${UUID_RE}(?: or id==@${UUID_RE})*$`);
 
 // Haystack timezone names are the city part of the IANA name.
 const iana = (hsTz) => (moment.tz.zone(hsTz) ? hsTz : moment.tz.names().find((n) => n.split("/").pop() === hsTz));
@@ -28,14 +31,52 @@ function networkError(code) {
 }
 
 /**
+ * Parse one end of a hisDelete range the way the API server's HZincReader does
+ * (widesky-api-server widesky/externals/haystack/io/HZincReader.js): a date, or a datetime whose
+ * offset is "Z" (tz UTC unless a name follows) or "+hh:mm" that MUST be followed by a tz name.
+ * Throws the server's message for anything else.
+ */
+function parseEnd(token) {
+    const tok = token.trim();
+    if (DATE_ONLY_RE.test(tok)) return { kind: "date", iso: tok };
+    const m = tok.match(DATETIME_RE);
+    if (!m) throw haystackError(400, `Invalid HDateTimeRange: ${tok}`);
+    const [, local, offset, name] = m;
+    if (!offset) throw haystackError(400, "Expected -/+ for timezone offset");
+    if (offset !== "Z" && !name) throw haystackError(400, "Expected space between timezone offset and name");
+    return { kind: "datetime", ms: Date.parse(local + offset), tz: name || "UTC" };
+}
+
+/**
+ * Validate a range as HDateTimeRange.make does (widesky-api-server
+ * widesky/externals/haystack/HDateTimeRange.js): keywords, one value, two dates, or two datetimes
+ * in the same named timezone. Everything else is a 400.
+ */
+function parseRange(range) {
+    const raw = range.replace(/^s:/, "").trim();
+    if (["first", "last", "today", "yesterday"].includes(raw)) return { keyword: raw };
+    const parts = raw.split(",");
+    if (parts.length > 2) throw haystackError(400, `Invalid HDateTimeRange: ${raw}`);
+    const start = parseEnd(parts[0]);
+    const end = parts.length === 2 ? parseEnd(parts[1]) : null;
+    if (end && start.kind !== end.kind) throw haystackError(400, `Invalid HDateTimeRange: ${raw}`);
+    if (end && start.kind === "datetime" && start.tz !== end.tz) throw haystackError(400, "arg1.tz != arg2.tz");
+    return { start, end };
+}
+
+/**
  * In-memory WideSky history server installed at the client's raw HTTP seam (_wsRawSubmit).
  * It stores rows per point, answers the planner's GraphQL COUNT histograms from them and applies
  * hisDelete requests to them, so tests assert on what was deleted rather than on how.
  *
- * Range semantics, as far as the unit suite needs: an ISO datetime with an offset is absolute;
- * one without is resolved in the point's timezone; a date-only end includes that whole day;
- * `today` / `yesterday` resolve in the point's timezone against `now`; start inclusive, end
- * exclusive. test/integration/hisDelete-e2e.js checks the real server against a plain hisDelete.
+ * Range grammar is the API server's: two dates, or two datetimes with an offset and the same tz
+ * name ("Z" alone means UTC); mixed forms, differing names, an offset without a name and a
+ * datetime without an offset are rejected with a 400, so tests cannot pin forms the server
+ * refuses. A date-only end includes that whole day in the point's timezone; `today` /
+ * `yesterday` resolve in the point's timezone against `now`; start inclusive, end exclusive.
+ * The count query's filter must be `id==@<uuid>` terms joined by " or ", or the response is a
+ * GraphQL error. test/integration/hisDelete-e2e.js checks the real server against a plain
+ * hisDelete.
  */
 class FakeHistoryServer {
     constructor({ points, recordLimit = 1500, now = Date.parse("2026-09-30T02:00:00Z") }) {
@@ -108,13 +149,17 @@ class FakeHistoryServer {
     }
 
     parseCount(query) {
-        const ids = [...query.matchAll(/id==@([\w-]+)/g)].map((m) => m[1]);
+        const [, filter] = query.match(/search\(filter: "([^"]*)"\)/);
+        const ids = COUNT_FILTER_RE.test(filter) ? [...filter.matchAll(/id==@([\w-]+)/g)].map((m) => m[1]) : null;
         const [, start, end] = query.match(/start: "([^"]+)", end: "([^"]+)"/);
         const [, unit] = query.match(/groupByUnits: (\w+)/);
-        return { uri: "/graphql", ids, fromMs: Date.parse(start), toMs: Date.parse(end), unit };
+        return { uri: "/graphql", ids: ids || [], badFilter: ids ? null : filter, fromMs: Date.parse(start), toMs: Date.parse(end), unit };
     }
 
-    count({ ids, fromMs, toMs, unit }) {
+    count({ ids, badFilter, fromMs, toMs, unit }) {
+        if (badFilter !== null) {
+            return { errors: [{ message: `Invalid filter: ${badFilter}` }] };
+        }
         const size = UNIT_MS[unit];
         const entity = ids.filter((id) => this.points.has(id)).map((id) => {
             const buckets = new Map();
@@ -140,25 +185,23 @@ class FakeHistoryServer {
     }
 
     resolve(range, tz) {
-        const raw = range.replace(/^s:/, "");
-        if (raw === "today" || raw === "yesterday") {
+        const { keyword, start, end } = parseRange(range);
+        if (keyword === "today" || keyword === "yesterday") {
             const day = moment.tz(this.now, tz).startOf("day");
-            if (raw === "yesterday") day.subtract(1, "day");
+            if (keyword === "yesterday") day.subtract(1, "day");
             return [day.valueOf(), day.clone().add(1, "day").valueOf()];
         }
-        const at = (token, isEnd) => {
-            const iso = token.trim().split(" ")[0];
-            if (DATE_ONLY_RE.test(iso)) {
-                const d = moment.tz(iso, "YYYY-MM-DD", tz);
-                return (isEnd ? d.add(1, "day") : d).valueOf();
-            }
-            return OFFSET_RE.test(iso) ? Date.parse(iso) : moment.tz(iso, moment.ISO_8601, tz).valueOf();
+        if (keyword || !end) throw new Error(`FakeHistoryServer: range ${range} is valid but not modelled`);
+        const at = (e, isEnd) => {
+            if (e.kind === "datetime") return e.ms;
+            const d = moment.tz(e.iso, "YYYY-MM-DD", tz);
+            return (isEnd ? d.add(1, "day") : d).valueOf();
         };
-        const [a, b] = raw.split(",");
-        return [at(a, false), at(b, true)];
+        return [at(start, false), at(end, true)];
     }
 
     delete(req) {
+        parseRange(req.range);   // grammar errors first, as the server parses before touching data
         const plan = req.ids.filter((id) => this.points.has(id)).map((id) => {
             const point = this.points.get(id);
             // A point with no tz tag resolves offset-less ends in UTC.
@@ -183,4 +226,4 @@ class FakeHistoryServer {
     }
 }
 
-module.exports = { FakeHistoryServer, haystackError, networkError, UNIT_MS };
+module.exports = { FakeHistoryServer, haystackError, networkError, UNIT_MS, parseRange };
