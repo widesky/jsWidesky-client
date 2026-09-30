@@ -366,11 +366,54 @@ describe("client.batch.hisDelete", () => {
             expect(fake.rows(id)).to.have.length(1440);
         });
 
+        it("still sends every planned request when one of them fails, and reports only that one", async () => {
+            // Three days of 1-minute rows at the default 500 budget plan into several requests.
+            const rows = every("2026-09-01T00:00:00Z", 3 * 1440, MIN);
+            const { ws, fake } = client({ [id]: { rows } });
+            let seen = 0;
+            fake.failNext((r) => isDelete(r) && ++seen === 2, () => haystackError(400, "Rejected"));
+            const res = await ws.batch.hisDelete([id], RANGE, { retries: 3, retryDelay: 0 });
+            const sent = fake.requests.filter(isDelete);
+            expect(sent.length).to.be.greaterThan(2);
+            const failed = sent[1].range;
+            expect(res.errors).to.eql([{ error: "Rejected", args: ["hisDelete", [id], failed] }]);
+            // Every request after the failed one was still attempted, and only the failed range remains.
+            const [from, to] = failed.replace(/^s:/, "").split(",").map((x) => t(x));
+            expect(fake.rows(id)).to.eql(rows.filter((r) => r >= from && r < to));
+            expect(fake.rows(id).length).to.be.greaterThan(0);
+        });
+
         it("runs requests in parallel without losing any", async () => {
             const { ws, fake } = client({ [id]: { rows: every("2026-09-01T00:00:00Z", 3 * 1440, MIN) } });
             const res = await ws.batch.hisDelete([id], RANGE, { parallel: 3 });
             expect(res.errors).to.eql([]);
             expect(fake.rows(id)).to.eql([]);
+        });
+    });
+
+    describe("option-source logging", () => {
+        const optionsLine = (ws) => ws.logger.debug.getCalls()
+            .map((c) => require("util").format(...c.args))
+            .find((s) => s.includes("batch.hisDelete options"));
+
+        it("logs each resolved option with where it came from", async () => {
+            const { ws } = client({ [PT.chwFlowTemp]: { rows: [] } }, {}, { batch: { hisDelete: { retryDelay: 5000 } } });
+            await ws.batch.hisDelete([PT.chwFlowTemp], RANGE, { retryDelay: 0 });
+            const line = optionsLine(ws);
+            expect(line).to.include("retryDelay=0 (call)");
+            expect(line).to.include("batchSize=500 (default)");
+        });
+
+        it("uses the client configuration when the call leaves an option out", async () => {
+            const { ws } = client({ [PT.chwFlowTemp]: { rows: [] } }, {}, { batch: { hisDelete: { batchSize: 250 } } });
+            await ws.batch.hisDelete([PT.chwFlowTemp], RANGE);
+            expect(optionsLine(ws)).to.include("batchSize=250 (client config)");
+        });
+
+        it("treats a null call option as not supplied", async () => {
+            const { ws } = client({ [PT.chwFlowTemp]: { rows: [] } }, {}, { batch: { hisDelete: { batchSize: 250 } } });
+            await ws.batch.hisDelete([PT.chwFlowTemp], RANGE, { batchSize: null });
+            expect(optionsLine(ws)).to.include("batchSize=250 (client config)");
         });
     });
 });
