@@ -324,6 +324,39 @@ describe("client.batch.hisDelete", () => {
         });
     });
 
+    describe("id forms", () => {
+        // client.hisDelete accepts "@<uuid>" and "r:<uuid> Dis"; planning must too.
+        const BNE_ZINC = "c4d5e6f7-0000-4a5b-8c9d-0000000000c4";
+        const BNE_DIS = "c4d5e6f7-0000-4a5b-8c9d-0000000000c5";
+        const ids = [`@${BNE_ZINC}`, `r:${BNE_DIS} Plant Room CHW Flow Temp`];
+        const points = () => ({
+            [BNE_ZINC]: { tz: "Brisbane", rows: every("2026-08-31T14:00:00Z", 3 * 1440, MIN) },
+            [BNE_DIS]: { tz: "Brisbane", rows: every("2026-08-31T14:00:00Z", 3 * 1440, MIN) }
+        });
+
+        it("counts and deletes points given as @uuid and r:uuid with a display name", async () => {
+            const { ws, fake } = client(points());
+            const res = await ws.batch.hisDelete(ids, "2026-08-31T14:00:00Z,2026-09-03T14:00:00Z");
+            expect(res.errors).to.eql([]);
+            expect(counts(fake)[0].ids).to.eql([BNE_ZINC, BNE_DIS]);
+            expect(deletes(fake).length).to.be.greaterThan(1);
+            expect(fake.rows(BNE_ZINC)).to.eql([]);
+            expect(fake.rows(BNE_DIS)).to.eql([]);
+        });
+
+        it("reads their timezone and plans a date-only range in it", async () => {
+            const { ws, fake } = client(points());
+            const res = await ws.batch.hisDelete(ids, "2026-09-01,2026-09-03");
+            expect(res.errors).to.eql([]);
+            expect(fake.requests.filter((r) => r.uri === "/api/read").map((r) => r.ids)).to.eql([[BNE_ZINC, BNE_DIS]]);
+            const sent = deletes(fake);
+            expect(sent.length).to.be.greaterThan(1);
+            for (const r of sent) for (const tok of ends(r)) expect(tok.endsWith(" Brisbane"), tok).to.be.true;
+            expect(fake.rows(BNE_ZINC)).to.eql([]);
+            expect(fake.rows(BNE_DIS)).to.eql([]);
+        });
+    });
+
     describe("relative ranges", () => {
         it("sends yesterday as one request per group without counting", async () => {
             const id = PT.chwFlowTemp;
@@ -445,6 +478,20 @@ describe("client.batch.hisDelete", () => {
             for (const x of ids.slice(0, 10)) expect(fake.rows(x), x).to.eql([]);
             for (const x of ids.slice(10)) expect(fake.rows(x), x).to.have.length(24);
         });
+
+        for (const [what, uri, range] of [
+            ["count query", "/graphql", "2026-08-31T14:00:00Z,2026-09-03T14:00:00Z"],
+            ["timezone read", "/api/read", "2026-09-01,2026-09-03"]
+        ]) {
+            it(`retries a failed ${what} with the delete retry settings`, async () => {
+                const { ws, fake } = client({ [id]: { tz: "Brisbane", rows: every("2026-08-31T14:00:00Z", 3 * 1440, MIN) } });
+                fake.failNext((r) => r.uri === uri, () => haystackError(503, "Service Unavailable"));
+                const res = await ws.batch.hisDelete([id], range, { retries: 1, retryDelay: 0 });
+                expect(res.errors).to.eql([]);
+                expect(fake.rows(id)).to.eql([]);
+                expect(fake.requests.filter((r) => r.uri === uri).length).to.be.greaterThan(1);
+            });
+        }
 
         it("treats a GraphQL error body as a failed count", async () => {
             const { ws, fake } = client(day());

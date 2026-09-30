@@ -475,7 +475,7 @@ async function hisDelete(ids, range, endOrOptions, maybeOptions) {
         let subGroups = [{ ids: group }];
         if (parsed.form === "date") {
             try {
-                subGroups = await groupByZone((groupIds) => this.read(groupIds), group);
+                subGroups = await groupByZone((groupIds) => withRetry(() => this.read(groupIds), { retries, retryDelay }), group);
             } catch (error) {
                 errors.push({ error: error.message, args: ["countQuery", group, range] });
                 continue;
@@ -489,8 +489,10 @@ async function hisDelete(ids, range, endOrOptions, maybeOptions) {
                 requests.push(unplannedRequest(sub.ids, parsed.raw));
                 continue;
             }
-            const countFn = async (fromMs, toMs, unit) =>
-                parseCountResponse(await this.query(buildCountQuery(sub.ids, fromMs, toMs, unit)), unit);
+            // Planning queries retry like deletes: a caller who sets retries expects planning to
+            // ride out the same transient failures.
+            const countFn = async (fromMs, toMs, unit) => parseCountResponse(
+                await withRetry(() => this.query(buildCountQuery(sub.ids, fromMs, toMs, unit)), { retries, retryDelay }), unit);
             try {
                 requests.push(...(await planGroup(countFn, sub.ids, parsed, window, resolved)));
             } catch (error) {

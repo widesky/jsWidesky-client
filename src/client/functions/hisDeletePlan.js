@@ -2,6 +2,7 @@
 
 const lodash = require("lodash");
 const moment = require("moment-timezone");
+const Ref = require("../../dataTypes/ref");
 
 const UNIT_MS = Object.freeze({
     WEEK: 604800000, DAY: 86400000, HOUR: 3600000, MINUTE: 60000, SECOND: 1000
@@ -14,6 +15,9 @@ const DATETIME_RE = /^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?)(Z|[+-
 const ZONED_FORMAT = "YYYY-MM-DDTHH:mm:ss.SSSZ";
 
 const toIso = (ms) => new Date(ms).toISOString();
+
+// The bare uuid of an id in any form client.hisDelete accepts ("uuid", "r:uuid Dis", "@uuid").
+const bareId = (id) => new Ref(id).id;
 
 /**
  * Map a Haystack timezone name to an IANA zone. Haystack names are the city part of the IANA
@@ -108,15 +112,14 @@ function windowFor(parsed, zone) {
  * ids with no tz tag, or one that does not map to an IANA zone, get iana null.
  */
 async function groupByZone(readFn, ids) {
-    const grid = await readFn(ids);
+    const grid = await readFn(ids.map(bareId));
     const tzById = new Map();
     for (const row of lodash.get(grid, "rows", []) || []) {
-        const id = String(row.id || "").replace(/^r:/, "").split(" ")[0];
-        tzById.set(id, row.tz ? String(row.tz).replace(/^s:/, "") : null);
+        if (row.id) tzById.set(bareId(row.id), row.tz ? String(row.tz).replace(/^s:/, "") : null);
     }
     const groups = new Map();
     for (const id of ids) {
-        const hsTz = tzById.get(String(id).replace(/^r:/, "")) || null;
+        const hsTz = tzById.get(bareId(id)) || null;
         if (!groups.has(hsTz)) groups.set(hsTz, []);
         groups.get(hsTz).push(id);
     }
@@ -124,7 +127,7 @@ async function groupByZone(readFn, ids) {
 }
 
 function buildCountQuery(ids, fromMs, toMs, unit) {
-    const filter = ids.map((id) => `id==@${String(id).replace(/^r:/, "")}`).join(" or ");
+    const filter = ids.map((id) => `id==@${bareId(id)}`).join(" or ");
     return `haystack { search(filter: "${filter}") { entity { id ` +
         `history(rangeAbsolute: {start: "${toIso(fromMs)}", end: "${toIso(toMs)}"}) { ` +
         `aggregate(function: COUNT, allEntities: false, ` +
