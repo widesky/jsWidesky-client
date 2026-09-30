@@ -108,11 +108,12 @@ is planned (its row counts requested) before any delete is sent.
    Datetimes must include seconds (`T00:00:00`, not `T00:00`), as the server requires.
 
    Any other range is not planned: relative ranges such as `today` or `yesterday`, a single value, a date paired with a
-   datetime, a datetime without an offset or without seconds, an offset without a timezone name, two different timezone
-   names, or a range that cannot be parsed. Also not planned: `Z` followed by a timezone name other than `UTC`, and
-   `+00:00` followed by a timezone name where that timezone is not at UTC+0 at that time. The server reads both as
-   local time in the named timezone, not as UTC. It is sent exactly as given, as one request per group, whatever its length, and cannot be
-   halved. The server accepts or rejects it; a rejection is reported in `errors` as a failed `hisDelete`.
+   datetime, a datetime without an offset or without seconds, an offset without a timezone name, two different
+   timezone names, or a range that cannot be parsed. Also not planned: `Z` followed by a timezone name other than
+   `UTC`, and `+00:00` followed by a timezone name where that timezone is not at UTC+0 at that time. The server reads
+   both as local time in the named timezone, not as UTC. It is sent exactly as given, as one request per group,
+   whatever its length, and cannot be halved. The server accepts or rejects it; a rejection is reported in `errors`
+   as a failed `hisDelete`.
 2. The server is asked for row counts over the range, in buckets of the first unit in `countBucketUnits`. A bucket
    counts as the highest row count of any entity in the group, since the server's limit applies per entity.
 3. Any bucket above `batchSize` is counted again in the next finer unit. A bucket still above `batchSize` at the finest
@@ -120,8 +121,10 @@ is planned (its row counts requested) before any delete is sent.
 4. Buckets are packed oldest first into requests that keep each entity at or below `batchSize` rows.
 5. The requests are contiguous and together cover the whole range, so rows written while the delete is running still
    fall inside a request.
-6. When the plan needs only one request, that request sends the range exactly as you gave it. When it is split, every
-   request uses the same form, and deletes the same rows as a single `client.hisDelete` of your range:
+6. When the plan needs only one request, that request sends the range exactly as you gave it. When it is split,
+   every request uses the same form, and together they delete the same rows as a single `client.hisDelete` of your
+   range. Some ranges are never split, because the server would misread the cuts; each is sent as one request exactly
+   as given, not halved, and a warning is logged (see "Ranges left unsplit" below):
    - `Z` datetimes: the first request keeps your start, the last keeps your end, and the cuts between them are `Z`
      datetimes;
    - datetimes with a timezone name: the first and last requests keep your start and end, and the cuts are datetimes in
@@ -143,6 +146,15 @@ point's timezone name, in one of two forms:
   to `2026-06-04T00:00:00.000+00:00 Adelaide`. The server misreads the minutes of an offset such as `+09:30`, but reads
   a `+00:00` offset with a timezone name as local time in that timezone, so this form deletes the intended rows. If the
   server's handling of either changes, this form must change with it.
+
+Ranges left unsplit, beyond the unplanned forms in step 1:
+- A range of datetimes with a timezone name, in a timezone with a part-hour offset at any time in the range (for example
+  `2026-06-01T00:00:00+10:00 Adelaide,2026-06-04T00:00:00+10:00 Adelaide`, even though you wrote a whole-hour offset).
+  The cuts would need the real `+09:30`, which the server misreads by about 29.5 hours.
+- A date range or a timezone-name range whose window contains a UTC-offset change that is not a whole number of
+  hours, such as Lord_Howe's 30-minute daylight saving change.
+- A date range where an end of the window falls in the hour that repeats when daylight saving ends, in a zone that would
+  be written with a `+00:00` offset.
 
 No cut is placed in the hour that repeats when daylight saving ends, if the cut would be written with a `+00:00`
 offset, because that local time names two instants. A point with no timezone, or one the client cannot map to a known
