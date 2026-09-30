@@ -151,4 +151,99 @@ describe("client.batch.hisDelete", () => {
         expect(fake.rows(PT.chwFlowTemp)).to.eql([]);
         expect(deletes(fake)).to.have.length(2);
     });
+    describe("ranges without an offset", () => {
+        const moment = require("moment-timezone");
+        const BNE = "b1e2c3d4-0000-4a5b-8c9d-0000000000b1";   // tz Brisbane, UTC+10
+        const NYC = "e5f6a7b8-0000-4a5b-8c9d-0000000000e5";   // tz New_York, UTC-4 in September
+        const RANGE_LOCAL = "2026-09-01,2026-09-03";          // three whole local days
+        // Dense 1-second data in the first and last local hour, 1-minute data between, and one
+        // row a millisecond either side of the local range.
+        function localPoint(hsTz, ianaTz) {
+            const from = moment.tz("2026-09-01", ianaTz).valueOf();
+            const to = moment.tz("2026-09-04", ianaTz).valueOf();
+            const rows = [from - 1, to];
+            for (let ms = from; ms < from + HOUR; ms += 1000) rows.push(ms);
+            for (let ms = from + HOUR; ms < to - HOUR; ms += MIN) rows.push(ms);
+            for (let ms = to - HOUR; ms < to; ms += 1000) rows.push(ms);
+            return { tz: hsTz, rows, outside: [from - 1, to], from, to };
+        }
+        const two = () => {
+            const bne = localPoint("Brisbane", "Australia/Brisbane");
+            const nyc = localPoint("New_York", "America/New_York");
+            return { bne, nyc, ...client({ [BNE]: bne, [NYC]: nyc }) };
+        };
+
+        it("deletes each point's whole local range and nothing outside it", async () => {
+            const { bne, nyc, ws, fake } = two();
+            const res = await ws.batch.hisDelete([BNE, NYC], RANGE_LOCAL);
+            expect(res.errors).to.eql([]);
+            expect(fake.rows(BNE)).to.eql(bne.outside);
+            expect(fake.rows(NYC)).to.eql(nyc.outside);
+        });
+
+        it("reads each group once to learn point timezones", async () => {
+            const { ws, fake } = two();
+            await ws.batch.hisDelete([BNE, NYC], RANGE_LOCAL);
+            expect(fake.requests.filter((r) => r.uri === "/api/read").map((r) => r.ids)).to.eql([[BNE, NYC]]);
+        });
+
+        it("keeps requests within budget despite dense data at both local ends", async () => {
+            const { ws, fake } = two();
+            await ws.batch.hisDelete([BNE, NYC], RANGE_LOCAL, { maxBisectDepth: 0 });
+            for (const r of deletes(fake)) {
+                expect(Math.max(...r.deleted), r.range).to.be.at.most(500);
+            }
+        });
+
+        it("places interior boundaries inside each point's local range", async () => {
+            const { bne, nyc, ws, fake } = two();
+            await ws.batch.hisDelete([BNE, NYC], RANGE_LOCAL);
+            for (const [id, p] of [[BNE, bne], [NYC, nyc]]) {
+                const mine = deletes(fake).filter((r) => r.ids.includes(id));
+                const interior = mine.slice(1).map((r) => Date.parse(r.range.replace(/^s:/, "").split(",")[0]));
+                expect(interior.length).to.be.greaterThan(0);
+                for (const b of interior) expect(b).to.be.within(p.from + 1, p.to - 1);
+                expect(mine[0].range.startsWith("s:2026-09-01,")).to.be.true;
+                expect(mine[mine.length - 1].range.endsWith(",2026-09-03")).to.be.true;
+            }
+        });
+
+        it("falls back to the 14-hour margin for a point with no timezone", async () => {
+            const NOTZ = "0a0b0c0d-0000-4a5b-8c9d-00000000000a";
+            // The fake resolves a point without tz in UTC; data is 1-minute across the UTC days.
+            const from = Date.parse("2026-09-01T00:00:00Z"), to = Date.parse("2026-09-04T00:00:00Z");
+            const rows = [from - 1, ...every("2026-09-01T00:00:00Z", 3 * 1440, MIN), to];
+            const { ws, fake } = client({ [NOTZ]: { tz: null, rows } });
+            const warn = ws.logger.warn;   // StubLogger already stubs warn; read its recorded calls
+            const res = await ws.batch.hisDelete([NOTZ], RANGE_LOCAL);
+            expect(res.errors).to.eql([]);
+            expect(fake.rows(NOTZ)).to.eql([from - 1, to]);
+            expect(warn.getCalls().some((c) => c.args.join(" ").includes("14 h margin"))).to.be.true;
+            const interior = deletes(fake).slice(1).map((r) => Date.parse(r.range.replace(/^s:/, "").split(",")[0]));
+            for (const b of interior) expect(b).to.be.within(from + 14 * HOUR, to - 14 * HOUR);
+        });
+
+        it("skips a group whose timezone read fails, and deletes nothing from it", async () => {
+            const { bne, ws, fake } = two();
+            const { haystackError } = require("./fakeHistoryServer");
+            fake.failNext((r) => r.uri === "/api/read", () => haystackError(500, "Read failed"));
+            const res = await ws.batch.hisDelete([BNE, NYC], RANGE_LOCAL);
+            expect(res.errors).to.eql([{ error: "Read failed", args: ["countQuery", [BNE, NYC], RANGE_LOCAL] }]);
+            expect(deletes(fake)).to.eql([]);
+            expect(fake.rows(BNE)).to.have.length(bne.rows.length);
+        });
+    });
+
+    describe("relative ranges", () => {
+        it("sends yesterday as one request per group without counting", async () => {
+            const id = PT.chwFlowTemp;
+            const moment = require("moment-timezone");
+            const yStart = moment.tz(Date.parse("2026-09-30T02:00:00Z"), "UTC").startOf("day").subtract(1, "day").valueOf();
+            const { ws, fake } = client({ [id]: { rows: [yStart - 1, ...every(new Date(yStart).toISOString(), 1440, MIN)] } });
+            await ws.batch.hisDelete([id], "yesterday");
+            expect(counts(fake)).to.eql([]);
+            expect(deletes(fake).map((r) => r.range)).to.eql(["s:yesterday"]);
+            expect(fake.rows(id)).to.eql([yStart - 1]);
+        });
+    });
 });
