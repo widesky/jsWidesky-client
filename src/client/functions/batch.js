@@ -400,6 +400,12 @@ const HIS_DELETE_OPTION_KEYS = [
     "retries", "retryDelay", "parallel", "batchDelay", "parallelDelay"
 ];
 
+/**
+ * Split ids into consecutive groups of at most `size`, keeping their order.
+ * @param {string[]} ids Point ids.
+ * @param {number} size Largest group (batchSizeEntity).
+ * @returns {string[][]}
+ */
 function chunkIds(ids, size) {
     const groups = [];
     for (let i = 0; i < ids.length; i += size) {
@@ -429,10 +435,22 @@ function chunkIds(ids, size) {
  * offset, and a date or named range containing a sub-hour DST change, is sent verbatim as one
  * request per group for the server to accept or reject.
  *
- * @param ids Point ids (array or single id).
- * @param range Haystack range string (with or without "s:"), or a Date for the start.
- * @param endOrOptions Date end (not inclusive) when `range` is a Date; otherwise the options.
- * @param maybeOptions Options when called with two Dates. See docs/client/batch.md.
+ * @param {string|string[]} ids Point ids (array or single id).
+ * @param {string|Date} range Haystack range string (with or without "s:"), or a Date for the start.
+ * @param {Date|Object} [endOrOptions] Date end (not inclusive) when `range` is a Date; otherwise the
+ *     options, with the keys listed under maybeOptions.
+ * @param {Object} [maybeOptions] Options when called with two Dates. See docs/client/batch.md.
+ * @param {number} [maybeOptions.batchSize=500] Most rows per entity in one request.
+ * @param {number} [maybeOptions.batchSizeEntity=10] Most point ids in one request.
+ * @param {number} [maybeOptions.maxBisectDepth=5] Times a request the server rejects for its row
+ *     limit may be halved.
+ * @param {string[]} [maybeOptions.countBucketUnits=["DAY","HOUR","MINUTE"]] Histogram units, coarsest first.
+ * @param {number} [maybeOptions.retries=0] Extra attempts after a transient failure.
+ * @param {number} [maybeOptions.retryDelay=2000] Milliseconds before each extra attempt.
+ * @param {number} [maybeOptions.parallel] Requests in flight at once.
+ * @param {number} [maybeOptions.batchDelay] Milliseconds between requests.
+ * @param {number} [maybeOptions.parallelDelay] Milliseconds between parallel starts.
+ * @param {boolean} [maybeOptions.returnResult=false] Collect each delete response in `success`.
  * @returns {Promise<{success: Array, errors: Array<{error: String, args: Array}>}>}
  *          errors[].args[0] is "hisDelete" for a failed delete and "countQuery" for a failed
  *          count; a group whose count fails is not deleted.
@@ -707,10 +725,10 @@ async function updateByFilter(filter, criteriaList, options={}) {
 
 /**
  * Perform a hisDelete using a filter to select the entities.
- * @param filter Filter to select the entities to be hisDelete'd.
- * @param start Starting timestamp to be deleted as a Date Object.
- * @param end Ending timestamp to be deleted as a Date Object (not inclusive).
- * @param options Options for batch.hisDelete plus `limit` (see docs/client/batch.md). Options not given
+ * @param {string} filter Filter to select the entities to be hisDelete'd.
+ * @param {Date} start Starting timestamp to be deleted.
+ * @param {Date} end Ending timestamp to be deleted (not inclusive).
+ * @param {Object} [options] Options for batch.hisDelete plus `limit` (see docs/client/batch.md). Options not given
  *                come from client config batch.hisDeleteByFilter, then its defaults; batch.hisDelete client
  *                config does not apply on this path. batchSize bounds the rows per entity per request.
  * @returns {Promise<{success: Array, errors: Array<{errors: String, args: Array}>}>}

@@ -18,14 +18,105 @@ const ZONED_FORMAT = "YYYY-MM-DDTHH:mm:ss.SSSZ";
 const WALL_FORMAT = "YYYY-MM-DDTHH:mm:ss.SSS";
 const HOUR_MS = 3600000;
 
+/**
+ * How a window's range ends are written. Every request of one split plan uses one form.
+ * @typedef {Object} BoundaryForm
+ * @property {function(number): string} format Writes an epoch-ms instant as a range end token.
+ * @property {function(number): boolean} cuttable Whether the server reads format(ms) back as ms.
+ */
+
+/**
+ * One end of a caller's range, as parseEnd reads it.
+ * @typedef {Object} RangeEnd
+ * @property {"date"|"zulu"|"named"} kind Date only, "...Z", or "<offset> <TzName>".
+ * @property {string} [iso] The "YYYY-MM-DD" date (kind "date").
+ * @property {string} [tok] The token as written (kind "zulu" or "named").
+ * @property {number} [ms] The instant in epoch ms (kind "zulu" or "named").
+ * @property {string} [tzName] The Haystack tz name ("UTC" for kind "zulu").
+ */
+
+/**
+ * A caller's range classified for planning (see parseRange).
+ * @typedef {Object} ParsedRange
+ * @property {boolean} plannable false when the range must be sent verbatim.
+ * @property {string} raw The range without its "s:" prefix.
+ * @property {"utc"|"named"|"date"} [form] How the range is planned (plannable only).
+ * @property {RangeEnd} [start] The first end (plannable only).
+ * @property {RangeEnd} [end] The second end (plannable only).
+ * @property {string} [iana] The IANA zone of a "named" range.
+ */
+
+/**
+ * Ids that share one Haystack `tz` tag.
+ * @typedef {Object} ZoneGroup
+ * @property {string|null} hsTz The raw tz tag, or null when the points have none.
+ * @property {string|null} iana Its IANA zone, or null when it does not map to one.
+ * @property {string[]} ids The point ids, in the caller's order.
+ */
+
+/**
+ * The window a (sub-)group is planned over (see windowFor), or why it cannot be cut.
+ * @typedef {Object} PlanWindow
+ * @property {string} [unsplittable] Set instead of every other field when the window is sent
+ *     verbatim as one request.
+ * @property {number} [startMs] Start instant in epoch ms.
+ * @property {number} [endMs] End instant in epoch ms.
+ * @property {string} [startTok] The first request's start token.
+ * @property {string} [endTok] The last request's end token.
+ * @property {function(number): string} [format] See BoundaryForm.
+ * @property {function(number): boolean} [cuttable] See BoundaryForm.
+ */
+
+/**
+ * One COUNT histogram bucket, counted as the most rows any one entity has in it.
+ * @typedef {Object} Bucket
+ * @property {number} start Bucket start in epoch ms (inclusive).
+ * @property {number} end Bucket end in epoch ms (exclusive).
+ * @property {number} count Rows of the busiest entity in the bucket.
+ */
+
+/**
+ * One planned hisDelete request.
+ * @typedef {Object} DeleteRequest
+ * @property {string[]} ids Point ids, at most batchSizeEntity of them.
+ * @property {string|null} startTok Start token in the window's form (null when unplanned).
+ * @property {string|null} endTok End token in the window's form (null when unplanned).
+ * @property {number} startMs Start in epoch ms (NaN when unplanned).
+ * @property {number} endMs End in epoch ms (NaN when unplanned).
+ * @property {number} depth Times this request has been bisected.
+ * @property {?function(number): string} format Boundary writer, or null when unplanned.
+ * @property {?function(number): boolean} cuttable Boundary check, or null when unplanned.
+ * @property {string} range The "s:start,end" range that is sent.
+ */
+
+/**
+ * Counts a group's rows between two instants, one bucket per `unit`.
+ * @callback CountFn
+ * @param {number} fromMs Start in epoch ms.
+ * @param {number} toMs End in epoch ms.
+ * @param {string} unit A GraphQL duration unit ("DAY", "HOUR", ...).
+ * @returns {Promise<Bucket[]>} Non-empty buckets, oldest first.
+ */
+
+/**
+ * Write an epoch-ms instant as an ISO 8601 UTC string.
+ * @param {number} ms Epoch milliseconds.
+ * @returns {string} e.g. "2026-09-01T00:00:00.000Z".
+ */
 const toIso = (ms) => new Date(ms).toISOString();
 
-// The bare uuid of an id in any form client.hisDelete accepts ("uuid", "r:uuid Dis", "@uuid").
+/**
+ * The bare uuid of an id in any form client.hisDelete accepts ("uuid", "r:uuid Dis", "@uuid").
+ * @param {string} id A point id.
+ * @returns {string} The uuid alone.
+ */
 const bareId = (id) => new Ref(id).id;
 
 /**
  * Map a Haystack timezone name to an IANA zone. Haystack names are the city part of the IANA
  * name ("Brisbane" -> "Australia/Brisbane"); an IANA name or "UTC" passes through.
+ * @param {string|null|undefined} hsTz A Haystack tz name, with or without "s:".
+ * @returns {string|null} The IANA zone, or null when there is none.
  */
 function ianaZone(hsTz) {
     if (!hsTz) return null;
@@ -38,6 +129,9 @@ function ianaZone(hsTz) {
  * True when the wall time of `ms` in `zone` (a moment-timezone Zone) names more than one instant,
  * i.e. `ms` falls in the hour a DST change repeats. The server reads a zero-offset token as wall
  * time, so such an instant cannot be written in that form without guessing which one it picks.
+ * @param {moment.MomentZone} zone The zone to test in.
+ * @param {number} ms Epoch milliseconds.
+ * @returns {boolean} true inside a repeated DST hour.
  */
 function isAmbiguousWall(zone, ms) {
     const own = zone.utcOffset(ms);             // minutes, UTC = local + offset
@@ -54,6 +148,9 @@ function isAmbiguousWall(zone, ms) {
  *
  * realOffset: `iana`'s real offset then the Haystack name ("...+10:00 Brisbane"). A token whose
  *     offset is zero is read as wall time (see wallTime), so it is cuttable only when unambiguous.
+ * @param {string} iana IANA zone the instants are written in.
+ * @param {string} hsName Haystack tz name written after the offset.
+ * @returns {BoundaryForm}
  */
 function realOffsetForm(iana, hsName) {
     const zone = moment.tz.zone(iana);
@@ -76,6 +173,9 @@ function realOffsetForm(iana, hsName) {
  * which the server reads as the intended instant. A server fix to EITHER behaviour changes what
  * these tokens mean; the live-stack check (test/integration/hisDelete-e2e.js, Adelaide points)
  * pins it.
+ * @param {string} iana IANA zone whose wall time is written.
+ * @param {string} hsName Haystack tz name written after "+00:00".
+ * @returns {BoundaryForm}
  */
 function wallTimeForm(iana, hsName) {
     const zone = moment.tz.zone(iana);
@@ -87,15 +187,27 @@ function wallTimeForm(iana, hsName) {
 
 const UTC_FORM = Object.freeze({ format: toIso, cuttable: () => true });
 
-// True when `zone`'s UTC offset has non-zero minutes at either end of [startMs, endMs] or in any
-// period that starts inside it.
+/**
+ * True when `zone`'s UTC offset has non-zero minutes at either end of [startMs, endMs] or in any
+ * period that starts inside it.
+ * @param {moment.MomentZone} zone The zone to test.
+ * @param {number} startMs Window start in epoch ms.
+ * @param {number} endMs Window end in epoch ms.
+ * @returns {boolean}
+ */
 function hasPartHourOffset(zone, startMs, endMs) {
     const at = [startMs, endMs, ...zone.untils.filter((u) => u > startMs && u < endMs)];
     return at.some((ms) => zone.utcOffset(ms) % 60 !== 0);
 }
 
-// True when a UTC-offset change inside (startMs, endMs) is not a whole number of hours (Lord_Howe's
-// 30-minute DST). The server's wall-time and offset arithmetic cannot place a cut around one.
+/**
+ * True when a UTC-offset change inside (startMs, endMs) is not a whole number of hours (Lord_Howe's
+ * 30-minute DST). The server's wall-time and offset arithmetic cannot place a cut around one.
+ * @param {moment.MomentZone} zone The zone to test.
+ * @param {number} startMs Window start in epoch ms.
+ * @param {number} endMs Window end in epoch ms.
+ * @returns {boolean}
+ */
 function hasSubHourTransition(zone, startMs, endMs) {
     return zone.untils
         .filter((u) => u > startMs && u < endMs)
@@ -105,6 +217,11 @@ function hasSubHourTransition(zone, startMs, endMs) {
 /**
  * Why a window in `iana` cannot be cut (rule d: one request, the caller's range verbatim), or null.
  * `named` callers write real offsets, which the server misreads whenever they carry minutes.
+ * @param {string} iana IANA zone of the window.
+ * @param {number} startMs Window start in epoch ms.
+ * @param {number} endMs Window end in epoch ms.
+ * @param {boolean} named true when the caller wrote "<offset> <TzName>" ends.
+ * @returns {string|null} The reason, or null when the window can be cut.
  */
 function unsplittableReason(iana, startMs, endMs, named) {
     const zone = moment.tz.zone(iana);
@@ -117,6 +234,11 @@ function unsplittableReason(iana, startMs, endMs, named) {
     return null;
 }
 
+/**
+ * Read one end of a Haystack range.
+ * @param {string} token A date or datetime token.
+ * @returns {RangeEnd|null} The end, or null when it is not a form the planner can cut around.
+ */
 function parseEnd(token) {
     const tok = token.trim();
     if (DATE_ONLY_RE.test(tok)) {
@@ -153,6 +275,8 @@ function parseEnd(token) {
  * without an offset or without seconds, "Z <Name>" for a zone other than UTC, "+00:00 <Name>"
  * where that zone is not at UTC+0, two different names, an empty or inverted range) is not
  * plannable: the caller's range is sent verbatim, one request per group, and the server decides.
+ * @param {string} range Haystack range, with or without "s:".
+ * @returns {ParsedRange}
  */
 function parseRange(range) {
     const raw = range.startsWith("s:") ? range.slice(2) : range;
@@ -193,6 +317,10 @@ function parseRange(range) {
  * a zone with no part-hour offset in the window: cuts written "+09:30 Adelaide" would be misread
  * by the server (~29.5 h), even when the caller wrote a whole-hour offset. Those, and any window
  * containing a sub-hour offset transition (date or named), are left unsplit.
+ * @param {ParsedRange} parsed A plannable range.
+ * @param {ZoneGroup|{ids: string[]}} zone The sub-group being planned; its iana and hsTz are
+ *     used for a "date" range only.
+ * @returns {PlanWindow}
  */
 function windowFor(parsed, zone) {
     if (parsed.form === "utc") {
@@ -227,6 +355,9 @@ function windowFor(parsed, zone) {
  * Split ids by the raw Haystack `tz` tag of each point, keeping first-seen order. Each sub-group
  * carries that name (written after the offset of its converted range ends) and its IANA zone;
  * ids with no tz tag, or one that does not map to an IANA zone, get iana null.
+ * @param {function(string[]): Promise<{rows: Object[]}>} readFn Reads the points by bare id.
+ * @param {string[]} ids Point ids.
+ * @returns {Promise<ZoneGroup[]>}
  */
 async function groupByZone(readFn, ids) {
     const grid = await readFn(ids.map(bareId));
@@ -243,6 +374,14 @@ async function groupByZone(readFn, ids) {
     return [...groups.entries()].map(([hsTz, groupIds]) => ({ hsTz, iana: ianaZone(hsTz), ids: groupIds }));
 }
 
+/**
+ * The GraphQL COUNT histogram query for a group of points.
+ * @param {string[]} ids Point ids.
+ * @param {number} fromMs Start in epoch ms.
+ * @param {number} toMs End in epoch ms.
+ * @param {string} unit GraphQL duration unit of each bucket.
+ * @returns {string} The query text.
+ */
 function buildCountQuery(ids, fromMs, toMs, unit) {
     const filter = ids.map((id) => `id==@${bareId(id)}`).join(" or ");
     return `haystack { search(filter: "${filter}") { entity { id ` +
@@ -255,6 +394,10 @@ function buildCountQuery(ids, fromMs, toMs, unit) {
 /**
  * Turn a COUNT histogram response into buckets. A bucket's count is the maximum across the
  * group's entities, because the API limit applies per entity.
+ * @param {Object} response The GraphQL response of buildCountQuery.
+ * @param {string} unit The query's bucket unit (sets each bucket's end).
+ * @returns {Bucket[]} Non-empty buckets, oldest first.
+ * @throws {Error} When the response carries GraphQL errors.
  */
 function parseCountResponse(response, unit) {
     const gqlErrors = lodash.get(response, "errors");
@@ -275,8 +418,13 @@ function parseCountResponse(response, unit) {
         .map(([start, count]) => ({ start, end: start + UNIT_MS[unit], count }));
 }
 
-// A bucket still over budget at the finest level is uniform enough at that scale to split
-// arithmetically (CORE-9414 splitBucketByTime).
+/**
+ * A bucket still over budget at the finest level is uniform enough at that scale to split
+ * arithmetically (CORE-9414 splitBucketByTime).
+ * @param {Bucket} bucket An over-budget bucket at the finest unit.
+ * @param {number} batchSize Rows per entity per request.
+ * @returns {Bucket[]} Equal time slices with estimated counts.
+ */
 function splitBucketByTime(bucket, batchSize) {
     const slices = Math.ceil(bucket.count / batchSize);
     if (slices <= 1) return [bucket];
@@ -291,6 +439,15 @@ function splitBucketByTime(bucket, batchSize) {
     return out;
 }
 
+/**
+ * Re-count an over-budget bucket at the next finer unit, recursively, until every bucket fits.
+ * @param {CountFn} countFn Counts the group's rows.
+ * @param {Bucket} bucket The bucket to refine.
+ * @param {string[]} units countBucketUnits, coarsest first.
+ * @param {number} level Index of `bucket`'s unit in `units`.
+ * @param {number} batchSize Rows per entity per request.
+ * @returns {Promise<Bucket[]>}
+ */
 async function refineBucket(countFn, bucket, units, level, batchSize) {
     if (bucket.count <= batchSize) return [bucket];
     if (level >= units.length - 1) return splitBucketByTime(bucket, batchSize);
@@ -306,6 +463,10 @@ async function refineBucket(countFn, bucket, units, level, batchSize) {
 /**
  * Greedy-pack buckets under the budget. A new request may only start at a bucket edge strictly
  * inside the window; otherwise the bucket folds into the current request.
+ * @param {Bucket[]} buckets Buckets oldest first.
+ * @param {number} batchSize Rows per entity per request.
+ * @param {PlanWindow} window The window being split.
+ * @returns {number[]} Cut instants in epoch ms, ascending.
  */
 function interiorBoundaries(buckets, batchSize, window) {
     const { startMs, endMs } = window;
@@ -322,8 +483,19 @@ function interiorBoundaries(buckets, batchSize, window) {
     return boundaries;
 }
 
-// `range` is what is sent. startTok/endTok/format/cuttable are the window's form, used whenever
-// the request is split, so every piece of a split stays in one server-accepted form.
+/**
+ * Build one request. `range` is what is sent. startTok/endTok/format/cuttable are the window's form, used whenever
+ * the request is split, so every piece of a split stays in one server-accepted form.
+ * @param {string[]} ids Point ids.
+ * @param {BoundaryForm} window The form the request is written in.
+ * @param {string} startTok Start token.
+ * @param {string} endTok End token.
+ * @param {number} startMs Start in epoch ms.
+ * @param {number} endMs End in epoch ms.
+ * @param {number} depth Bisection depth.
+ * @param {string} [range] Range to send; defaults to "s:startTok,endTok".
+ * @returns {DeleteRequest}
+ */
 function makeRequest(ids, window, startTok, endTok, startMs, endMs, depth, range) {
     return {
         ids, startTok, endTok, startMs, endMs, depth, format: window.format, cuttable: window.cuttable,
@@ -331,7 +503,12 @@ function makeRequest(ids, window, startTok, endTok, startMs, endMs, depth, range
     };
 }
 
-/** One request with the caller's range verbatim, never bisected (not plannable, or rule d). */
+/**
+ * One request with the caller's range verbatim, never bisected (not plannable, or rule d).
+ * @param {string[]} ids Point ids.
+ * @param {string} raw The caller's range without "s:".
+ * @returns {DeleteRequest}
+ */
 function unplannedRequest(ids, raw) {
     return { ids, startTok: null, endTok: null, startMs: NaN, endMs: NaN, depth: 0, format: null, cuttable: null, range: `s:${raw}` };
 }
@@ -339,6 +516,11 @@ function unplannedRequest(ids, raw) {
 /**
  * Requests for a window cut at `boundaries`. With no boundary the one request sends the caller's
  * range verbatim (it still carries the window's form, for bisection).
+ * @param {string[]} ids Point ids.
+ * @param {ParsedRange} parsed The caller's range.
+ * @param {PlanWindow} window The window being split.
+ * @param {number[]} boundaries Cut instants in epoch ms, ascending.
+ * @returns {DeleteRequest[]}
  */
 function buildRequests(ids, parsed, window, boundaries) {
     if (boundaries.length === 0) {
@@ -356,6 +538,17 @@ function buildRequests(ids, parsed, window, boundaries) {
     return requests;
 }
 
+/**
+ * Plan one (sub-)group: count it, refine over-budget buckets and pack them into requests.
+ * @param {CountFn} countFn Counts the group's rows.
+ * @param {string[]} ids Point ids.
+ * @param {ParsedRange} parsed The caller's range.
+ * @param {PlanWindow} window The window to plan over.
+ * @param {Object} options Resolved batch.hisDelete options.
+ * @param {number} options.batchSize Rows per entity per request.
+ * @param {string[]} options.countBucketUnits Histogram units, coarsest first.
+ * @returns {Promise<DeleteRequest[]>}
+ */
 async function planGroup(countFn, ids, parsed, window, { batchSize, countBucketUnits }) {
     const coarse = await countFn(window.startMs, window.endMs, countBucketUnits[0]);
     const buckets = [];
@@ -369,6 +562,8 @@ async function planGroup(countFn, ids, parsed, window, { batchSize, countBucketU
  * Halve a request at its midpoint, written in the request's own form. A midpoint the form cannot
  * write unambiguously (a repeated DST hour) moves an hour later or earlier. Returns null when it
  * cannot be split (unplanned, or too short to halve).
+ * @param {DeleteRequest} req The request the server rejected.
+ * @returns {DeleteRequest[]|null} Two halves one level deeper, or null.
  */
 function splitRequest(req) {
     if (!req.format) return null;
