@@ -16,6 +16,7 @@
   - [Path `client.batch.hisDeleteByFilter`](#path-clientbatchhisdeletebyfilter)
   - [Path `client.batch.updateOrCreate`](#path-clientbatchupdateorcreate)
   - [Path `client.batch.multiFind`](#path-clientbatchmultifind)
+  - [Retries](#retries)
 
 <!-- tocstop -->
 
@@ -38,6 +39,9 @@ The `batch` property of the `options` argument used in `WideSkyClient` is expect
 | `hisDeleteByFilter`      | Define the default batch configurations for this functions. | Object |  As per the table of configurations for `client.batch.hisDeleteByFilter`  |
 | `updateOrCreate`         | Define the default batch configurations for this functions. | Object |   As per the table of configurations for `client.batch.updateOrCreate`    |
 
+Every batch operation accepts `retries` and `retryDelay`, in its client configuration or in the options of the call.
+See [Retries](#retries).
+
 ### Path `client.batch.hisRead`
 The Object in `client.batch.hisRead` is expected to have the following structure:
 
@@ -47,6 +51,8 @@ The Object in `client.batch.hisRead` is expected to have the following structure
 | `batchDelay`                     | Define the time in between each batch `hisRead` request (ms).                | Number  |    0    |
 | `parallel`                       | Define the number of batched requests to be run in parallel                  | Number  |    1    |
 | `parallelDelay`                  | Define the delay between each set of batched requests run in parallel (ms)   | Number  |    0    |
+| `retries`                        | Define how many times a request is retried after a transient failure (see [Retries](#retries)). `0` disables retrying. Between 0 and 10. | Number | 0 |
+| `retryDelay`                     | Define the time to wait before each retry (ms). `0` means no delay. | Number | 2000 |
 
 ### Path `client.batch.hisWrite`
 The Object in `client.batch.hisWrite` is expected to have the following structure:
@@ -58,6 +64,8 @@ The Object in `client.batch.hisWrite` is expected to have the following structur
 | `batchDelay`                      | Define the time in between each batch `hisWrite` request (ms).                | Number  |    0    |
 | `parallel`                        | Define the number of batched requests to be run in parallel                   | Number  |    1    |
 | `parallelDelay`                   | Define the delay between each set of batched requests run in parallel (ms)    | Number  |    0    |
+| `retries`                         | Define how many times a request is retried after a transient failure (see [Retries](#retries)). `0` disables retrying. Between 0 and 10. | Number | 0 |
+| `retryDelay`                      | Define the time to wait before each retry (ms). `0` means no delay. | Number | 2000 |
 | `returnResult`                    | Enable the result from WideSky API server operation `hisWrite` to be returned | Boolean | `false` |
 
 ### Path `client.batch.hisDelete`
@@ -174,7 +182,8 @@ and `args[0]` tells the kinds apart:
 | `"countQuery"` | Counting (or reading timezones) for a group failed. The group is skipped and nothing is deleted for its entities.   | `["countQuery", ids, range]`  |
 | `"plan"`       | The range, or the group, cannot be cut into requests within `batchSize`. Nothing is sent for those entities.        | `["plan", ids, range]`        |
 
-Row counts and timezone reads are retried like delete requests, with the same `retries` and `retryDelay`.
+Row counts and timezone reads are retried like delete requests, with the same `retries` and `retryDelay`. Only these
+options apply: `client.performOpInBatch.retries` never adds attempts on top of them.
 
 A request rejected because it exceeds the per-entity record limit ("data points per entity cannot exceed") is halved
 and both halves are sent, up to `maxBisectDepth` times. A request is retried up to `retries` times, waiting `retryDelay`
@@ -195,6 +204,8 @@ The Object in `client.batch.create` is expected to have the following structure:
 | `batchDelay`                    | Define the time in between each batch `create` request (ms).                | Number  |    0    |
 | `parallel`                      | Define the number of batched requests to be run in parallel                 | Number  |    1    |
 | `parallelDelay`                 | Define the delay between each set of batched requests run in parallel (ms)  | Number  |    0    |
+| `retries`                       | Define how many times a request is retried after a transient failure (see [Retries](#retries)). `0` disables retrying. Between 0 and 10. | Number | 0 |
+| `retryDelay`                    | Define the time to wait before each retry (ms). `0` means no delay. | Number | 2000 |
 | `returnResult`                  | Enable the result from WideSky API server operation `create` to be returned | Boolean | `false` |
 
 ### Path `client.batch.update`
@@ -206,6 +217,8 @@ The Object in `client.batch.update` is expected to have the following structure:
 | `batchDelay`                    | Define the time in between each batch `update` request (ms).                | Number  |    0    |
 | `parallel`                      | Define the number of batched requests to be run in parallel                 | Number  |    1    |
 | `parallelDelay`                 | Define the delay between each set of batched requests run in parallel (ms)  | Number  |    0    |
+| `retries`                       | Define how many times a request is retried after a transient failure (see [Retries](#retries)). `0` disables retrying. Between 0 and 10. | Number | 0 |
+| `retryDelay`                    | Define the time to wait before each retry (ms). `0` means no delay. | Number | 2000 |
 | `returnResult`                  | Enable the result from WideSky API server operation `update` to be returned | Boolean | `false` |
 
 ### Path `client.batch.deleteById`
@@ -217,6 +230,8 @@ The Object in `client.batch.deleteById` is expected to have the following struct
 | `batchDelay`                        | Define the time in between each batch `deleteById` request (ms).                | Number  |    0    |
 | `parallel`                          | Define the number of batched requests to be run in parallel                     | Number  |    1    |
 | `parallelDelay`                     | Define the delay between each set of batched requests run in parallel (ms)      | Number  |    0    |
+| `retries`                           | Define how many times a request is retried after a transient failure (see [Retries](#retries)). `0` disables retrying. Between 0 and 10. | Number | 0 |
+| `retryDelay`                        | Define the time to wait before each retry (ms). `0` means no delay. | Number | 2000 |
 | `returnResult`                      | Enable the result from WideSky API server operation `deleteById` to be returned | Boolean | `false` |
 
 ### Path `client.batch.deleteByFilter`
@@ -228,6 +243,8 @@ The Object in `client.batch.deleteByFilter` is expected to have the following st
 | `batchDelay`                            | Define the time in between each batch `deleteByFilter` request (ms).                | Number  |    0    |
 | `parallel`                              | Define the number of batched requests to be run in parallel                         | Number  |    1    |
 | `parallelDelay`                         | Define the delay between each set of batched requests run in parallel (ms)          | Number  |    0    |
+| `retries`                               | Define how many times a request is retried after a transient failure (see [Retries](#retries)). `0` disables retrying. Between 0 and 10. | Number | 0 |
+| `retryDelay`                            | Define the time to wait before each retry (ms). `0` means no delay. | Number | 2000 |
 | `returnResult`                          | Enable the result from WideSky API server operation `deleteByFilter` to be returned | Boolean | `false` |
 
 ### Path `client.batch.hisReadByFilter`
@@ -239,6 +256,8 @@ The Object in `client.batch.hisReadByFilter` is expected to have the following s
 | `batchDelay`                             | Define the time in between each batch `hisReadByFilter` request (ms).                | Number  |    0    |
 | `parallel`                               | Define the number of batched requests to be run in parallel                          | Number  |    1    |
 | `parallelDelay`                          | Define the delay between each set of batched requests run in parallel (ms)           | Number  |    0    |
+| `retries`                                | Define how many times a request is retried after a transient failure (see [Retries](#retries)). `0` disables retrying. Between 0 and 10. | Number | 0 |
+| `retryDelay`                             | Define the time to wait before each retry (ms). `0` means no delay. | Number | 2000 |
 | `returnResult`                           | Enable the result from WideSky API server operation `hisReadByFilter` to be returned | Boolean | `false` |
 | `filter`                                 | Define the maximum number of entities to be returned. 0 means no limit.              | Number  |    0    |
 
@@ -251,6 +270,8 @@ The Object in `client.batch.addChildrenByFilter` is expected to have the followi
 | `batchDelay`                                 | Define the time in between each batch `addChildrenByFilter` request (ms).                | Number  |    0    |
 | `parallel`                                   | Define the number of batched requests to be run in parallel                              | Number  |    1    |
 | `parallelDelay`                              | Define the delay between each set of batched requests run in parallel (ms)               | Number  |    0    |
+| `retries`                                    | Define how many times a request is retried after a transient failure (see [Retries](#retries)). `0` disables retrying. Between 0 and 10. | Number | 0 |
+| `retryDelay`                                 | Define the time to wait before each retry (ms). `0` means no delay. | Number | 2000 |
 | `returnResult`                               | Enable the result from WideSky API server operation `addChildrenByFilter` to be returned | Boolean | `false` |
 | `filter`                                     | Define the maximum number of entities to be returned. 0 means no limit.                  | Number  |    0    |
 
@@ -263,6 +284,8 @@ The Object in `client.batch.updateByFilter` is expected to have the following st
 | `batchDelay`                            | Define the time in between each batch `updateByFilter` request (ms).                | Number  |    0    |
 | `parallel`                              | Define the number of batched requests to be run in parallel                         | Number  |    1    |
 | `parallelDelay`                         | Define the delay between each set of batched requests run in parallel (ms)          | Number  |    0    |
+| `retries`                               | Define how many times a request is retried after a transient failure (see [Retries](#retries)). `0` disables retrying. Between 0 and 10. | Number | 0 |
+| `retryDelay`                            | Define the time to wait before each retry (ms). `0` means no delay. | Number | 2000 |
 | `returnResult`                          | Enable the result from WideSky API server operation `updateByFilter` to be returned | Boolean | `false` |
 | `filter`                                | Define the maximum number of entities to be returned. 0 means no limit.             | Number  |    0    |
 
@@ -275,6 +298,8 @@ The Object in `client.batch.migrateHistory` is expected to have the following st
 | `batchDelay`                            | Define the time in between each batch `migrateHistory` request (ms).                | Number  |    0    |
 | `parallel`                              | Define the number of batched requests to be run in parallel                         | Number  |    1    |
 | `parallelDelay`                         | Define the delay between each set of batched requests run in parallel (ms)          | Number  |    0    |
+| `retries`                               | Define how many times a request is retried after a transient failure (see [Retries](#retries)). `0` disables retrying. Between 0 and 10. | Number | 0 |
+| `retryDelay`                            | Define the time to wait before each retry (ms). `0` means no delay. | Number | 2000 |
 | `returnResult`                          | Enable the result from WideSky API server operation `migrateHistory` to be returned | Boolean | `false` |
 
 ### Path `client.batch.hisDeleteByFilter`
@@ -309,6 +334,8 @@ The Object in `client.batch.updateOrCreate` is expected to have the following st
 | `batchDelay`                            | Define the time in between each batch `update` or `reate` request (ms).                 | Number  |    0    |
 | `parallel`                              | Define the number of batched requests to be run in parallel                             | Number  |    1    |
 | `parallelDelay`                         | Define the delay between each set of batched requests run in parallel (ms)              | Number  |    0    |
+| `retries`                               | Define how many times a request is retried after a transient failure (see [Retries](#retries)). `0` disables retrying. Between 0 and 10. | Number | 0 |
+| `retryDelay`                            | Define the time to wait before each retry (ms). `0` means no delay. | Number | 2000 |
 | `returnResult`                          | Enable the result from WideSky API server operation `update` or `create` to be returned | Boolean | `true`  |
 
 ### Path `client.batch.multiFind`
@@ -320,4 +347,27 @@ The Object in `client.batch.multiFind` is expected to have the following structu
 | `batchDelay`                       | Define the time in between each batch `multiFind` request (ms).            | Number |    0    |
 | `parallel`                         | Define the number of batched requests to be run in parallel                | Number |    1    |
 | `parallelDelay`                    | Define the delay between each set of batched requests run in parallel (ms) | Number |    0    |
+| `retries`                          | Define how many times a request is retried after a transient failure (see [Retries](#retries)). `0` disables retrying. Between 0 and 10. | Number | 0 |
+| `retryDelay`                       | Define the time to wait before each retry (ms). `0` means no delay. | Number | 2000 |
 | `filter`                           | Define the maximum number of entities to be returned. 0 means no limit.    | Number |    0    |
+
+### Retries
+Each batch operation splits its payload into requests. With `retries` above `0`, a request that fails is sent again,
+up to `retries` times, waiting `retryDelay` ms before each extra attempt, only for these failures:
+- HTTP status 500, 502, 503 or 504.
+- Network error codes `ENETDOWN`, `ENETUNREACH`, `ECONNABORTED`, `ECONNRESET`, `ETIMEDOUT`, `ECONNREFUSED`, `EHOSTDOWN`
+  or `EHOSTUNREACH`.
+
+Any other failure, including HTTP 429, other 4xx statuses and a per-entity record-limit error, is not retried. Only the
+failed request is sent again; the other requests of the batch are not repeated. A request that still fails after its
+retries is reported in `errors` exactly as it is without retries. The default `0` sends each request once.
+
+A retried write can be applied twice: if the server applied a request but its response was lost (for example a reset
+connection or a 504 from a proxy), the retry sends it again. That is harmless for reads and for `hisWrite`, `update`
+and `deleteById`, but `create`, `addChildrenByFilter` and the create half of `updateOrCreate` can create the entities
+again. Leave `retries` at `0` for them, or check for duplicates afterwards, if that matters.
+
+The options are resolved per call like the others: the call options, then `client.batch.<operation>`, then the
+defaults. `performOpInBatch` called directly also takes them, defaulting to `client.performOpInBatch`.
+`batch.hisDelete` and `batch.hisDeleteByFilter` retry their own count queries, timezone reads and deletes (see
+[Failures and retries](#failures-and-retries)).

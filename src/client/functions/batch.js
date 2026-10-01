@@ -20,7 +20,7 @@ const lodash = require("lodash");
 const {
     parseRange, groupByZone, windowFor, buildCountQuery, parseCountResponse, planGroup, splitRequest
 } = require("./hisDeletePlan");
-const { withRetry, isRecordLimitError } = require("./hisDeleteRetry");
+const { withRetry, isRecordLimitError } = require("./batchRetry");
 const HisWritePayload = require("../../utils/hisWritePayload");
 const { sleep } = require("../../utils/tools");
 const Hs = require("../../utils/haystack");
@@ -182,16 +182,18 @@ function createBatchIterator(op, payload, clientArgs, batchSize, transformer, ba
 
 /**
  * Create a request with success and error handlers.
- * @param op Client function to be performed.
- * @param args Arguments to be called for the client operation.
- * @param result Result Object to append success or error responses to.
- * @param returnResult If true, append the result of the operation to result.success. Do nothing otherwise.
- * @returns {Promise<unknown>}
+ * @param {string} op Client function to be performed.
+ * @param {Array} args Arguments to be called for the client operation.
+ * @param {{success: Array, errors: Array}} result Result Object to append success or error responses to.
+ * @param {boolean} returnResult If true, append the result of the operation to result.success. Do nothing otherwise.
+ * @param {{retries: number, retryDelay: number}} retry Extra attempts after a transient failure (see
+ *     batchRetry.withRetry) and the milliseconds before each. Only the final failure is recorded.
+ * @returns {Promise<void>}
  */
-function createBatchRequest(op, args, result, returnResult) {
+function createBatchRequest(op, args, result, returnResult, retry) {
     return new Promise(async (resolve) => {
         try {
-            const res = await this[op](...args);
+            const res = await withRetry(() => this[op](...args), retry);
             if (returnResult) {
                 result.success.push(res);
             }
@@ -208,9 +210,9 @@ function createBatchRequest(op, args, result, returnResult) {
 
 /**
  * Perform a WideSky client operation in batches or in parallel.
- * @param op Function to be called on the client instance.
- * @param args An Array of arguments to be passed to the client. The first index must be the batch'able payload.
- * @param options An Object of options available to configure the operation. These include:
+ * @param {string} op Function to be called on the client instance.
+ * @param {Array} args An Array of arguments to be passed to the client. The first index must be the batch'able payload.
+ * @param {Object} [options] An Object of options available to configure the operation. These include:
  *                - batchSize: Size of each batch sent to API server. For a payload of type Object, this is the \
  *                             number of keys.
  *                - batchDelay: Delay in milliseconds between the completion of a request and the next request to be
@@ -218,6 +220,9 @@ function createBatchRequest(op, args, result, returnResult) {
  *                - parallel: Number of batched requests to run in parallel.
  *                - parallelDelay: Delay in milliseconds between each set of parallel requests.
  *                - returnResult: Enable or disable returning the result of the queries sent.
+ *                - retries: Extra attempts for a request after a transient failure (5xx in 500/502/503/504 or a
+ *                           network error). 0 (default) disables retry.
+ *                - retryDelay: Delay in milliseconds before each extra attempt.
  *                - transformer: A function to transform the payload to be passed to the client operation.
  * @returns {Promise<{success: Array, errors: Array<{errors: String, args: Array}>}>}
  *          - success: Contain the responses of successful operations when options.returnResult is true.
@@ -232,7 +237,9 @@ async function performOpInBatch(op, args, options={}) {
         batchDelay,
         returnResult,
         parallel,
-        parallelDelay
+        parallelDelay,
+        retries,
+        retryDelay
     } = deriveFromDefaults(this.clientOptions.performOpInBatch, options);
 
     let { transformer } = options;
@@ -267,7 +274,7 @@ async function performOpInBatch(op, args, options={}) {
         for (let i = 0; i < parallel && hasMore(); i++) {
             const { next, size } = getNext();
             sizeTotal += size;
-            requests.push(createBatchRequest.call(this, op, next, result, returnResult));
+            requests.push(createBatchRequest.call(this, op, next, result, returnResult, { retries, retryDelay }));
             if (batchDelay > 0) {
                 await sleep(batchDelay);
             }
@@ -564,8 +571,9 @@ async function hisDelete(ids, range, endOrOptions, maybeOptions) {
     };
 
     // The engine only paces and parallelises here; runRequest records its own results so that
-    // bisected halves and original errors are kept. The receiver is a stand-in so the dispatch
-    // name never lands on the shared client instance.
+    // bisected halves and original errors are kept, and retries on its own (retries: 0 keeps a
+    // client-wide performOpInBatch.retries from retrying on top). The receiver is a stand-in so
+    // the dispatch name never lands on the shared client instance.
     const runner = Object.create(this);
     runner.runHisDeleteRequest = runRequest;
     await this.performOpInBatch.call(runner, "runHisDeleteRequest", [[...requests]], {
@@ -574,7 +582,8 @@ async function hisDelete(ids, range, endOrOptions, maybeOptions) {
         parallel: resolved.parallel,
         batchDelay: resolved.batchDelay,
         parallelDelay: resolved.parallelDelay,
-        returnResult: false
+        returnResult: false,
+        retries: 0
     });
 
     return { success, errors };

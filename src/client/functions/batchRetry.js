@@ -1,5 +1,8 @@
 "use strict";
 
+// Retry of one batched request after a transient failure. Used by performOpInBatch for every
+// batch operation, and by batch.hisDelete for its planning queries and deletes.
+
 const { sleep } = require("../../utils/tools");
 
 // Copied from the widesky-edge-history delete node's shouldRetry (1.7.5) so moving retry into
@@ -50,8 +53,8 @@ function isRetryable(err) {
 }
 
 /**
- * Whether the API server rejected a delete for exceeding its rows-per-entity limit. Such a
- * request is bisected, never retried.
+ * Whether the API server rejected a request for exceeding its rows-per-entity limit. Such a
+ * request is never retried: the same request would fail again (batch.hisDelete bisects it).
  * @param {*} err The thrown error.
  * @returns {boolean} true when the message or the error grid's dis carries RECORD_LIMIT_TEXT.
  */

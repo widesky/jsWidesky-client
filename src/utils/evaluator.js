@@ -15,8 +15,6 @@ const HIS_DELETE_ENTITY_BATCH_SIZE = 10;
 const HIS_DELETE_ENTITY_BATCH_SIZE_MAX = 1000;
 const HIS_DELETE_MAX_BISECT_DEPTH = 5;
 const HIS_DELETE_MAX_BISECT_DEPTH_MAX = 10;
-const HIS_DELETE_RETRIES_MAX = 10;
-const HIS_DELETE_RETRY_DELAY = 2000;
 // GraphQL `duration` enum values usable as histogram levels, coarsest first.
 const HIS_DELETE_BUCKET_UNIT_ORDER = ["WEEK", "DAY", "HOUR", "MINUTE", "SECOND"];
 const HIS_DELETE_COUNT_BUCKET_UNITS = ["DAY", "HOUR", "MINUTE"];
@@ -32,6 +30,10 @@ const READ_BY_FILTER_BATCH_SIZE_MAX = 200;
 const PERFORM_OP_IN_BATCH_BATCH_SIZE = 100;
 const PERFORM_OP_IN_BATCH_MAX_BATCH_SIZE = 10 ** 9;
 const PERFORM_OP_IN_BATCH_MAX_PARALLEL = 100;
+// Extra attempts per batched request after a transient failure. Capped so a misconfigured site
+// cannot hold a batch open retrying one request indefinitely.
+const BATCH_RETRIES_MAX = 10;
+const BATCH_RETRY_DELAY = 2000;
 
 function deriveFromDefaults(defaultConfig, passedConfig) {
     for (const [key, value] of Object.entries(defaultConfig)) {
@@ -92,7 +94,23 @@ const PERFORM_OP_IN_BATCH_OBJ = {
         .nullable()
         .strict()
         .min(0)
-        .default(0)
+        .default(0),
+    // Retry each batched request after a transient failure (see client/functions/batchRetry.js).
+    retries: yup.number()
+        .notRequired()
+        .nullable()
+        .strict()
+        .integer()
+        .min(0)
+        .max(BATCH_RETRIES_MAX)
+        .default(0),
+    retryDelay: yup.number()
+        .notRequired()
+        .nullable()
+        .strict()
+        .integer()
+        .min(0)
+        .default(BATCH_RETRY_DELAY)
 };
 
 // Client function schema for options arguments
@@ -134,21 +152,6 @@ const BATCH_HIS_DELETE_SCHEMA = yup.object({
                 HIS_DELETE_BUCKET_UNIT_ORDER.indexOf(unit) > HIS_DELETE_BUCKET_UNIT_ORDER.indexOf(units[i - 1]))
         )
         .default(() => [...HIS_DELETE_COUNT_BUCKET_UNITS]),
-    retries: yup.number()
-        .notRequired()
-        .nullable()
-        .strict()
-        .integer()
-        .min(0)
-        .max(HIS_DELETE_RETRIES_MAX)
-        .default(0),
-    retryDelay: yup.number()
-        .notRequired()
-        .nullable()
-        .strict()
-        .integer()
-        .min(0)
-        .default(HIS_DELETE_RETRY_DELAY),
     ...getReturnResultProp(false)
 });
 const BATCH_CREATE_SCHEMA = yup.object({
@@ -212,21 +215,6 @@ const BATCH_HIS_DELETE_BY_FILTER_SCHEMA = yup.object({
                 HIS_DELETE_BUCKET_UNIT_ORDER.indexOf(unit) > HIS_DELETE_BUCKET_UNIT_ORDER.indexOf(units[i - 1]))
         )
         .default(() => [...HIS_DELETE_COUNT_BUCKET_UNITS]),
-    retries: yup.number()
-        .notRequired()
-        .nullable()
-        .strict()
-        .integer()
-        .min(0)
-        .max(HIS_DELETE_RETRIES_MAX)
-        .default(0),
-    retryDelay: yup.number()
-        .notRequired()
-        .nullable()
-        .strict()
-        .integer()
-        .min(0)
-        .default(HIS_DELETE_RETRY_DELAY),
     ...getReturnResultProp(false),
     ...LIMIT_PROPERTY
 });

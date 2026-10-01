@@ -6,6 +6,7 @@ This project adheres to [Semantic Versioning](http://semver.org/).
 
 ### Added
 - [CORE-9209](https://widesky.atlassian.net/browse/CORE-9209): `batch.hisDelete` options `maxBisectDepth`, `countBucketUnits`, `retries` and `retryDelay`, and `client.features.hisDeletePlanner` for feature detection.
+- [CORE-9209](https://widesky.atlassian.net/browse/CORE-9209): `retries` and `retryDelay` options for every batch operation, retrying requests that fail with a 5xx or network error.
 
 ### Changed
 - [CORE-9209](https://widesky.atlassian.net/browse/CORE-9209): `batch.hisDelete` sizes deletes from server-side record counts instead of reading every row first, and accepts a Haystack range string as well as two Dates.

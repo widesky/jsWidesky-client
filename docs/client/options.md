@@ -52,6 +52,8 @@ The Object defined in `client.performOpInBatch` is expected to have the followin
 | `parallel`                          | Define the number of batched requests to be run in parallel                | Number  |    1    |
 | `parallelDelay`                     | Define the delay between each set of batched requests run in parallel (ms) | Number  |    0    |
 | `returnResult`                      | Enable the result from WideSky API server operation to be returned         | Boolean | `false` |
+| `retries`                           | Define how many times a request is retried after a transient failure (HTTP 500, 502, 503, 504 or a network error). `0` disables retrying. Between 0 and 10. A retried `create` can create its entities twice if the first attempt succeeded but its response was lost. See [Retries](batch.md#retries). | Number  |    0    |
+| `retryDelay`                        | Define the time to wait before each retry (ms). `0` means no delay.        | Number  |  2000   |
 
 
 ### Path `http`

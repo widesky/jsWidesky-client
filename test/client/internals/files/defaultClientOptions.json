@@ -7,34 +7,46 @@
       "limit": 0,
       "parallel": 1,
       "parallelDelay": 0,
-      "returnResult": false
+      "returnResult": false,
+      "retries": 0,
+      "retryDelay": 2000
     },
     "create": {
       "batchDelay": 0,
       "batchSize": 2000,
       "parallel": 1,
       "parallelDelay": 0,
-      "returnResult": false
+      "returnResult": false,
+      "retries": 0,
+      "retryDelay": 2000
     },
     "deleteByFilter": {
       "batchDelay": 0,
       "batchSize": 30,
       "parallel": 1,
       "parallelDelay": 0,
-      "returnResult": false
+      "returnResult": false,
+      "retries": 0,
+      "retryDelay": 2000
     },
     "deleteById": {
       "batchDelay": 0,
       "batchSize": 30,
       "parallel": 1,
       "parallelDelay": 0,
-      "returnResult": false
+      "returnResult": false,
+      "retries": 0,
+      "retryDelay": 2000
     },
     "hisDelete": {
       "batchDelay": 0,
       "batchSize": 500,
       "batchSizeEntity": 10,
-      "countBucketUnits": ["DAY", "HOUR", "MINUTE"],
+      "countBucketUnits": [
+        "DAY",
+        "HOUR",
+        "MINUTE"
+      ],
       "maxBisectDepth": 5,
       "parallel": 1,
       "parallelDelay": 0,
@@ -46,7 +58,11 @@
       "batchDelay": 0,
       "batchSize": 500,
       "batchSizeEntity": 10,
-      "countBucketUnits": ["DAY", "HOUR", "MINUTE"],
+      "countBucketUnits": [
+        "DAY",
+        "HOUR",
+        "MINUTE"
+      ],
       "limit": 0,
       "maxBisectDepth": 5,
       "parallel": 1,
@@ -59,14 +75,18 @@
       "batchDelay": 0,
       "batchSize": 100,
       "parallel": 1,
-      "parallelDelay": 0
+      "parallelDelay": 0,
+      "retries": 0,
+      "retryDelay": 2000
     },
     "hisReadByFilter": {
       "batchDelay": 0,
       "batchSize": 100,
       "limit": 0,
       "parallel": 1,
-      "parallelDelay": 0
+      "parallelDelay": 0,
+      "retries": 0,
+      "retryDelay": 2000
     },
     "hisWrite": {
       "batchDelay": 0,
@@ -74,21 +94,27 @@
       "batchSizeEntity": 100,
       "parallel": 1,
       "parallelDelay": 0,
-      "returnResult": false
+      "returnResult": false,
+      "retries": 0,
+      "retryDelay": 2000
     },
     "migrateHistory": {
       "batchDelay": 0,
       "batchSize": 10000,
       "parallel": 1,
       "parallelDelay": 0,
-      "returnResult": false
+      "returnResult": false,
+      "retries": 0,
+      "retryDelay": 2000
     },
     "update": {
       "batchDelay": 0,
       "batchSize": 2000,
       "parallel": 1,
       "parallelDelay": 0,
-      "returnResult": false
+      "returnResult": false,
+      "retries": 0,
+      "retryDelay": 2000
     },
     "updateByFilter": {
       "batchDelay": 0,
@@ -96,21 +122,27 @@
       "limit": 0,
       "parallel": 1,
       "parallelDelay": 0,
-      "returnResult": false
+      "returnResult": false,
+      "retries": 0,
+      "retryDelay": 2000
     },
     "updateOrCreate": {
       "batchDelay": 0,
       "batchSize": 2000,
       "parallel": 1,
       "parallelDelay": 0,
-      "returnResult": true
+      "returnResult": true,
+      "retries": 0,
+      "retryDelay": 2000
     },
     "multiFind": {
       "batchDelay": 0,
       "batchSize": 10,
       "parallel": 1,
       "parallelDelay": 0,
-      "limit": 0
+      "limit": 0,
+      "retries": 0,
+      "retryDelay": 2000
     }
   },
   "impersonateAs": null,
@@ -119,7 +151,9 @@
     "batchSize": 100,
     "parallel": 1,
     "parallelDelay": 0,
-    "returnResult": false
+    "returnResult": false,
+    "retries": 0,
+    "retryDelay": 2000
   },
   "progress": {
     "create": "create",
