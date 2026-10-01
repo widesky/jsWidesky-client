@@ -290,7 +290,9 @@ The Object in `client.batch.updateByFilter` is expected to have the following st
 | `filter`                                | Define the maximum number of entities to be returned. 0 means no limit.             | Number  |    0    |
 
 ### Path `client.batch.migrateHistory`
-The Object in `client.batch.migrateHistory` is expected to have the following structure:
+The Object in `client.batch.migrateHistory` is expected to have the following structure. Its options, `retries` and
+`retryDelay` included, apply to the `hisWrite` requests. The history is read with `batch.hisRead`, which uses
+`client.batch.hisRead`.
 
 | Path from `client.batch.migrateHistory` | Description                                                                         |  Type   | Default |
 |-----------------------------------------|-------------------------------------------------------------------------------------|:-------:|:-------:|
@@ -326,7 +328,9 @@ The Object in `client.batch.hisDeleteByFilter` is expected to have the following
 | `limit`                                    | Define the maximum number of entities to be returned by the filter. 0 means no limit.                                        | Number  |              0              |
 
 ### Path `client.batch.updateOrCreate`
-The Object in `client.batch.updateOrCreate` is expected to have the following structure:
+The Object in `client.batch.updateOrCreate` is expected to have the following structure. Its options, `retries` and
+`retryDelay` included, apply to the `create` and `update` requests. Existing entities are looked up with
+`batch.multiFind`, which uses `client.batch.multiFind`.
 
 | Path from `client.batch.updateOrCreate` | Description                                                                             |  Type   | Default |
 |-----------------------------------------|-----------------------------------------------------------------------------------------|:-------:|:-------:|
@@ -360,14 +364,19 @@ up to `retries` times, waiting `retryDelay` ms before each extra attempt, only f
 
 Any other failure, including HTTP 429, other 4xx statuses and a per-entity record-limit error, is not retried. Only the
 failed request is sent again; the other requests of the batch are not repeated. A request that still fails after its
-retries is reported in `errors` exactly as it is without retries. The default `0` sends each request once.
+retries is reported in `errors` exactly as it is without retries. The default `0` sends each request once. Results
+stay in request order whichever request finishes last. With `parallel` above `1`, a retrying request holds up the start
+of the next parallel group by up to `retries` × `retryDelay` plus the time of each attempt.
 
 A retried write can be applied twice: if the server applied a request but its response was lost (for example a reset
-connection or a 504 from a proxy), the retry sends it again. That is harmless for reads and for `hisWrite`, `update`
-and `deleteById`, but `create`, `addChildrenByFilter` and the create half of `updateOrCreate` can create the entities
+connection or a 504 from a proxy), the retry sends it again. That is harmless for reads and for `hisWrite` and
+`update`. A retried `deleteById` deletes nothing twice, but it can report an error for an id that the lost attempt had
+in fact deleted. `create`, `addChildrenByFilter` and the create half of `updateOrCreate` can create the entities
 again. Leave `retries` at `0` for them, or check for duplicates afterwards, if that matters.
 
 The options are resolved per call like the others: the call options, then `client.batch.<operation>`, then the
 defaults. `performOpInBatch` called directly also takes them, defaulting to `client.performOpInBatch`.
+`client.performOpInBatch.retries` applies only to direct `performOpInBatch` calls; set it per operation under
+`client.batch.<operation>`.
 `batch.hisDelete` and `batch.hisDeleteByFilter` retry their own count queries, timezone reads and deletes (see
 [Failures and retries](#failures-and-retries)).

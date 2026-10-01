@@ -181,31 +181,20 @@ function createBatchIterator(op, payload, clientArgs, batchSize, transformer, ba
 }
 
 /**
- * Create a request with success and error handlers.
+ * Send one batched request, retrying it after a transient failure.
  * @param {string} op Client function to be performed.
  * @param {Array} args Arguments to be called for the client operation.
- * @param {{success: Array, errors: Array}} result Result Object to append success or error responses to.
- * @param {boolean} returnResult If true, append the result of the operation to result.success. Do nothing otherwise.
  * @param {{retries: number, retryDelay: number}} retry Extra attempts after a transient failure (see
- *     batchRetry.withRetry) and the milliseconds before each. Only the final failure is recorded.
- * @returns {Promise<void>}
+ *     batchRetry.withRetry) and the milliseconds before each. Only the final failure is reported.
+ * @returns {Promise<{res: *}|{error: {error: string, args: Array}}>} The response, or the error entry to report.
+ *     Never rejects, so the caller can record outcomes in request order once a parallel group settles.
  */
-function createBatchRequest(op, args, result, returnResult, retry) {
-    return new Promise(async (resolve) => {
-        try {
-            const res = await withRetry(() => this[op](...args), retry);
-            if (returnResult) {
-                result.success.push(res);
-            }
-        } catch (error) {
-            result.errors.push({
-                error: error.message,
-                args: [op, ...args]
-            });
-        } finally {
-            resolve();
-        }
-    });
+async function createBatchRequest(op, args, retry) {
+    try {
+        return { res: await withRetry(() => this[op](...args), retry) };
+    } catch (error) {
+        return { error: { error: error.message, args: [op, ...args] } };
+    }
 }
 
 /**
@@ -274,12 +263,20 @@ async function performOpInBatch(op, args, options={}) {
         for (let i = 0; i < parallel && hasMore(); i++) {
             const { next, size } = getNext();
             sizeTotal += size;
-            requests.push(createBatchRequest.call(this, op, next, result, returnResult, { retries, retryDelay }));
+            requests.push(createBatchRequest.call(this, op, next, { retries, retryDelay }));
             if (batchDelay > 0) {
                 await sleep(batchDelay);
             }
         }
-        await Promise.all(requests);
+        // Record in request order, not completion order: a retried request finishes after its peers,
+        // and hisRead / multiFind read success by position.
+        for (const outcome of await Promise.all(requests)) {
+            if (outcome.error) {
+                result.errors.push(outcome.error);
+            } else if (returnResult) {
+                result.success.push(outcome.res);
+            }
+        }
 
         if (this.isProgressEnabled) {
             p1[this.clientOptions.progress.update](added += sizeTotal);
@@ -357,12 +354,25 @@ async function hisRead(ids, from, to, options={}) {
         }
     );
 
-    // process hisRead data
+    // process hisRead data. Requests cover consecutive slices of ids, and success / errors are both
+    // in request order, so walking the slices places each response on its own ids: a failed slice
+    // keeps its ids empty, and a vN column is relative to the slice it came from.
     const resultByEntity = init2DArray(ids.length);
-    for (let i = 0; i < data.length; i++) {
-        const res = data[i];
+    let nextSuccess = 0;
+    let nextError = 0;
+    for (let start = 0; start < ids.length; start += options.batchSize) {
+        const slice = ids.slice(start, start + options.batchSize);
+        const failed = errors[nextError];
+        if (failed && lodash.isEqual(failed.args[1], slice)) {
+            nextError++;
+            continue;
+        }
+        const res = data[nextSuccess++];
+        if (res === undefined) {
+            break;
+        }
         if (ids.length === 1 || options.batchSize === 1) {
-            resultByEntity[i] = res.rows;
+            resultByEntity[start] = res.rows;
         } else {
             if (!isRowsSorted(res.rows)) {
                 // issues found with rows not being sorted by their respective time stamp
@@ -389,8 +399,12 @@ async function hisRead(ids, from, to, options={}) {
                         continue;
                     }
 
-                    const index = Number(vId.slice(1));
-                    resultByEntity[index].push({ts, val});
+                    const column = Number(vId.slice(1));
+                    if (!(column < slice.length)) {
+                        // Not a column of a point this request asked for.
+                        continue;
+                    }
+                    resultByEntity[start + column].push({ts, val});
                 }
             }
         }

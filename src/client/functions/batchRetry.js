@@ -74,7 +74,7 @@ function isRecordLimitError(err) {
  * @template T
  * @param {function(): Promise<T>} fn The request to make.
  * @param {Object} options Retry options.
- * @param {number} options.retries Extra attempts after the first (0 disables retry).
+ * @param {number} [options.retries] Extra attempts after the first (0, null or absent disables retry).
  * @param {number} options.retryDelay Milliseconds to wait before each extra attempt.
  * @returns {Promise<T>} What `fn` resolves to.
  * @throws {*} The last error when attempts run out or the error is not retryable.
@@ -84,7 +84,7 @@ async function withRetry(fn, { retries, retryDelay }) {
         try {
             return await fn();
         } catch (err) {
-            if (attempt >= retries || !isRetryable(err) || isRecordLimitError(err)) {
+            if (attempt >= (retries ?? 0) || !isRetryable(err) || isRecordLimitError(err)) {
                 throw err;
             }
             if (retryDelay > 0) {
