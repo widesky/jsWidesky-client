@@ -18,7 +18,7 @@ This project adheres to [Semantic Versioning](http://semver.org/).
   - `batch.hisDeleteByFilter` uses the same planner, new defaults (500 / 10) and the new options.
 
 ### Fixed
-- [CORE-9209](https://widesky.atlassian.net/browse/CORE-9209): `batch.hisRead` returns each point's history on that point when a request fails or the points span several requests.
+- [CORE-9209](https://widesky.atlassian.net/browse/CORE-9209): `batch.hisRead` and `hisRead` return each point's history on that point when a request fails, the points span several requests, or a request holds one point.
 
 ## [3.5.0] - 2026-08-13
 

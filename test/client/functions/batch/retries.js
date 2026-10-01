@@ -30,6 +30,8 @@ class FakeApiServer {
         this.requests = [];
         this.faults = [];
         this.written = [];
+        // Extra column added to every hisRead row, to model a response the client cannot map.
+        this.extraHisReadColumn = {};
     }
 
     install(ws) {
@@ -71,15 +73,17 @@ class FakeApiServer {
             return { meta: { ver: "2.0" }, cols: [{ name: "id" }], rows: req.rows };
         }
         if (uri === "/api/hisRead") {
-            // POST hisRead answers ts + v0..vN, one column per requested point, merged on ts.
+            // As the API server answers (checked against api-server 0.27.1): one point gives ts + val,
+            // several give ts + v0..vN, one column per requested point, merged on ts.
             const ids = req.ids;
+            const colName = (k) => (ids.length === 1 ? "val" : `v${k}`);
             const byTs = new Map();
             ids.forEach((id, k) => {
                 for (const { ts, val } of HISTORY[id]) {
-                    byTs.set(ts, { ...(byTs.get(ts) || { ts }), [`v${k}`]: val });
+                    byTs.set(ts, { ...(byTs.get(ts) || { ts }), [colName(k)]: val, ...this.extraHisReadColumn });
                 }
             });
-            return { meta: { ver: "2.0" }, cols: [{ name: "ts" }, ...ids.map((id, k) => ({ name: `v${k}` }))],
+            return { meta: { ver: "2.0" }, cols: [{ name: "ts" }, ...ids.map((id, k) => ({ name: colName(k) }))],
                 rows: [...byTs.values()] };
         }
         if (uri === "/graphql") {
@@ -110,7 +114,7 @@ const HISTORY = {
     [AHU.mixedAirTemp]: [{ ts: "t:2026-09-01T00:10:00Z UTC", val: "n:18.6" }],
     [AHU.outsideAirTemp]: [{ ts: "t:2026-09-01T00:15:00Z UTC", val: "n:9.4" }],
 };
-// What batch.hisRead returns for a point read alone (batchSize 1): the raw rows, value in v0.
+// What batch.hisRead returns for a point read alone with batchSize 1: client.hisRead's merged rows, value in v0.
 const aloneRows = (id) => HISTORY[id].map(({ ts, val }) => ({ ts, v0: val }));
 const SEP_1 = new Date("2026-09-01T00:00:00Z"), SEP_2 = new Date("2026-09-02T00:00:00Z");
 
@@ -222,6 +226,27 @@ describe("client batch operations: retries", () => {
         expect(res.errors).to.eql([]);
         expect(server.sent("/api/hisRead")).to.have.length(3);
         expect(res.success).to.eql(points.map((id) => HISTORY[id]));
+    });
+
+    it("batch.hisRead maps a last request of one point, answered with a val column, onto that point", async () => {
+        const { ws, server } = client();
+        const points = [AHU.supplyAirTemp, AHU.returnAirTemp, AHU.mixedAirTemp];
+        const res = await ws.batch.hisRead(points, SEP_1, SEP_2, { batchSize: 2 });
+        expect(server.sent("/api/hisRead").map((r) => r.ids.length)).to.eql([2, 1]);
+        expect(res.errors).to.eql([]);
+        expect(res.success).to.eql(points.map((id) => HISTORY[id]));
+    });
+
+    it("batch.hisRead reports a request whose response has a column it cannot map, instead of dropping rows", async () => {
+        const { ws, server } = client();
+        server.extraHisReadColumn = { v7: "n:0" };
+        const points = [AHU.supplyAirTemp, AHU.returnAirTemp];
+        // batchSize above the point count: the response reaches batch.hisRead as the server sent it.
+        const res = await ws.batch.hisRead(points, SEP_1, SEP_2, { batchSize: 3 });
+        expect(res.errors).to.have.length(1);
+        expect(res.errors[0].args.slice(0, 2)).to.eql(["hisRead", points]);
+        expect(res.errors[0].error).to.match(/v7/);
+        expect(res.success).to.eql([[], []]);
     });
 
     it("batch.multiFind keeps each filter's result in filter order when one request is retried", async () => {

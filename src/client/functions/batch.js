@@ -328,6 +328,25 @@ async function hisWrite(hisWriteData, options={}) {
 }
 
 /**
+ * The position, within its request, of the point a hisRead response column holds.
+ * @param {string} name Column name from the response row (not "ts").
+ * @param {number} requested Number of points in the request.
+ * @returns {number|null} The point's position in the request, or null when the column matches none of them.
+ *     The API server names the value column "val" when one point is read and "v0".."vN" for several.
+ */
+function hisReadColumn(name, requested) {
+    if (name === "val") {
+        return requested === 1 ? 0 : null;
+    }
+    const match = /^v(\d+)$/.exec(name);
+    if (match === null) {
+        return null;
+    }
+    const position = Number(match[1]);
+    return position < requested ? position : null;
+}
+
+/**
  * Perform a history read request using batch functionality.
  * @param   ids Entities to read.
  * @param   from Haystack read range or a Date Object representing where to grab historical data from.
@@ -356,14 +375,18 @@ async function hisRead(ids, from, to, options={}) {
 
     // process hisRead data. Requests cover consecutive slices of ids, and success / errors are both
     // in request order, so walking the slices places each response on its own ids: a failed slice
-    // keeps its ids empty, and a vN column is relative to the slice it came from.
+    // keeps its ids empty, and a value column ("val" for one point, "vN" for several) is relative to
+    // the slice it came from.
     const resultByEntity = init2DArray(ids.length);
+    // Request errors plus any response that cannot be mapped, in request order.
+    const orderedErrors = [];
     let nextSuccess = 0;
     let nextError = 0;
     for (let start = 0; start < ids.length; start += options.batchSize) {
         const slice = ids.slice(start, start + options.batchSize);
         const failed = errors[nextError];
         if (failed && lodash.isEqual(failed.args[1], slice)) {
+            orderedErrors.push(failed);
             nextError++;
             continue;
         }
@@ -392,19 +415,30 @@ async function hisRead(ids, from, to, options={}) {
                 });
             }
 
+            const unmapped = new Set();
+            for (const row of res.rows) {
+                for (const name of Object.keys(row)) {
+                    if (name !== "ts" && hisReadColumn(name, slice.length) === null) {
+                        unmapped.add(name);
+                    }
+                }
+            }
+            if (unmapped.size > 0) {
+                // Never drop rows silently: the slice is reported and its points keep no rows.
+                orderedErrors.push({
+                    error: `hisRead response has column(s) ${[...unmapped].join(", ")} matching none of the ` +
+                        `${slice.length} requested point(s)`,
+                    args: ["hisRead", slice, from, to, options.batchSize]
+                });
+                continue;
+            }
+
             for (const row of res.rows) {
                 const { ts } = row;
-                for (const [vId, val] of Object.entries(row)) {
-                    if (vId === "ts") {
-                        continue;
+                for (const [name, val] of Object.entries(row)) {
+                    if (name !== "ts") {
+                        resultByEntity[start + hisReadColumn(name, slice.length)].push({ts, val});
                     }
-
-                    const column = Number(vId.slice(1));
-                    if (!(column < slice.length)) {
-                        // Not a column of a point this request asked for.
-                        continue;
-                    }
-                    resultByEntity[start + column].push({ts, val});
                 }
             }
         }
@@ -412,7 +446,7 @@ async function hisRead(ids, from, to, options={}) {
 
     return {
         success: resultByEntity,
-        errors: errors
+        errors: orderedErrors
     };
 }
 
