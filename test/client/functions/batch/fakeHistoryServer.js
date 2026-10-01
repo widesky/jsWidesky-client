@@ -10,7 +10,7 @@ const DATE_ONLY_RE = /^\d{4}-\d{2}-\d{2}$/;
 // (colon required), then an optional " TzName".
 const DATETIME_RE = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})(?::(\d{2})(?:\.(\d*))?)?(Z|[+-]\d{2}:\d{2})?(?: (\S+))?$/;
 const UUID_RE = "[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}";
-const COUNT_FILTER_RE = new RegExp(`^id==@${UUID_RE}(?: or id==@${UUID_RE})*$`);
+const escapeRe = (str) => str.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
 // Haystack timezone names are the city part of the IANA name.
 const iana = (hsTz) => (moment.tz.zone(hsTz) ? hsTz : moment.tz.names().find((n) => n.split("/").pop() === hsTz));
@@ -107,14 +107,16 @@ function parseRange(range) {
  * tests cannot pin forms the server refuses. Datetime ends resolve to the instant the server
  * reads (see parseEnd), including its misreading of offsets with non-zero minutes. A date-only end includes that whole day in the point's timezone; `today` /
  * `yesterday` resolve in the point's timezone against `now`; start inclusive, end exclusive.
- * The count query's filter must be `id==@<uuid>` terms joined by " or ", or the response is a
+ * The count query's filter must be `id==@<uuid or fqname>` terms joined by " or ", or the response is a
  * GraphQL error. test/integration/hisDelete-e2e.js checks the real server against a plain
  * hisDelete.
  */
 class FakeHistoryServer {
     constructor({ points, recordLimit = 1500, now = Date.parse("2026-09-30T02:00:00Z") }) {
         this.points = new Map(Object.entries(points).map(([id, p]) =>
-            [id, { tz: p.tz === undefined ? "UTC" : p.tz, rows: [...p.rows].sort((a, b) => a - b) }]));
+            [id, { tz: p.tz === undefined ? "UTC" : p.tz, fqname: p.fqname || null, rows: [...p.rows].sort((a, b) => a - b) }]));
+        // The server also accepts a point's fqname wherever it accepts its id.
+        this.byFqname = new Map([...this.points.entries()].filter(([, p]) => p.fqname).map(([id, p]) => [p.fqname, id]));
         this.recordLimit = recordLimit;
         this.now = now;
         this.requests = [];
@@ -125,6 +127,12 @@ class FakeHistoryServer {
     install(ws) {
         ws._wsRawSubmit = sinon.stub().callsFake((method, uri, body, config) => this.handle(uri, body, config));
         return this;
+    }
+
+    // The point's uuid for an id given as a uuid or as an fqname, else null.
+    lookup(id) {
+        if (this.points.has(id)) return id;
+        return this.byFqname.get(id) || null;
     }
 
     rows(id) {
@@ -154,11 +162,15 @@ class FakeHistoryServer {
                 readFault.times -= 1;
                 throw readFault.makeError(req);
             }
-            const rows = req.ids.filter((id) => this.points.has(id)).map((id) => {
-                const tz = this.points.get(id).tz;
-                return tz === null ? { id: `r:${id}`, kind: "s:Number" } : { id: `r:${id}`, kind: "s:Number", tz: `s:${tz}` };
+            // Rows carry the uuid id (never the fqname asked for) plus the fqname tag when the point has one.
+            const rows = req.ids.map((id) => this.lookup(id)).filter((id) => id !== null).map((id) => {
+                const { tz, fqname } = this.points.get(id);
+                const row = { id: `r:${id}`, kind: "s:Number" };
+                if (tz !== null) row.tz = `s:${tz}`;
+                if (fqname) row.fqname = `s:${fqname}`;
+                return row;
             });
-            return { meta: { ver: "2.0" }, cols: [{ name: "id" }, { name: "kind" }, { name: "tz" }], rows };
+            return { meta: { ver: "2.0" }, cols: [{ name: "id" }, { name: "kind" }, { name: "tz" }, { name: "fqname" }], rows };
         }
         if (uri === "/graphql") {
             req = this.parseCount(body.query);
@@ -183,7 +195,9 @@ class FakeHistoryServer {
 
     parseCount(query) {
         const [, filter] = query.match(/search\(filter: "([^"]*)"\)/);
-        const ids = COUNT_FILTER_RE.test(filter) ? [...filter.matchAll(/id==@([\w-]+)/g)].map((m) => m[1]) : null;
+        const term = [UUID_RE, ...this.byFqname.keys()].map((x) => (x === UUID_RE ? x : escapeRe(x))).join("|");
+        const filterRe = new RegExp(`^id==@(?:${term})(?: or id==@(?:${term}))*$`);
+        const ids = filterRe.test(filter) ? [...filter.matchAll(/id==@([^\s]+)/g)].map((m) => m[1]) : null;
         const [, start, end] = query.match(/start: "([^"]+)", end: "([^"]+)"/);
         const [, unit] = query.match(/groupByUnits: (\w+)/);
         return { uri: "/graphql", ids: ids || [], badFilter: ids ? null : filter, fromMs: Date.parse(start), toMs: Date.parse(end), unit };
@@ -198,7 +212,7 @@ class FakeHistoryServer {
             return { errors: [{ message: `COUNT range start ${new Date(fromMs).toISOString()} is not before end ${new Date(toMs).toISOString()}` }] };
         }
         const size = UNIT_MS[unit];
-        const entity = ids.filter((id) => this.points.has(id)).map((id) => {
+        const entity = ids.map((id) => this.lookup(id)).filter((id) => id !== null).map((id) => {
             const buckets = new Map();
             for (const ts of this.points.get(id).rows) {
                 if (ts < fromMs || ts >= toMs) continue;
@@ -239,7 +253,7 @@ class FakeHistoryServer {
 
     delete(req) {
         parseRange(req.range);   // grammar errors first, as the server parses before touching data
-        const plan = req.ids.filter((id) => this.points.has(id)).map((id) => {
+        const plan = req.ids.map((id) => this.lookup(id)).filter((id) => id !== null).map((id) => {
             const point = this.points.get(id);
             // A point with no tz tag resolves offset-less ends in UTC.
             const [from, to] = this.resolve(req.range, iana(point.tz || "UTC"));

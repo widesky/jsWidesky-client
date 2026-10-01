@@ -701,6 +701,57 @@ describe("client.batch.hisDelete", () => {
         });
     });
 
+    describe("points given by fqname", () => {
+        // The API server accepts a point's fqname as its id but answers with the point's uuid and an
+        // fqname tag, so the timezone lookup must match rows by either.
+        const BNE_FQ = "jsclient_hisdelete_e2e.plantroom.ahu_supply_temp";
+        const NYC_FQ = "jsclient_hisdelete_e2e.plantroom.chw_return_temp";
+        const BNE = "b0e1a2c3-0000-4a5b-8c9d-0000000000b2", NYC = "4e0a1b2c-0000-4a5b-8c9d-0000000000e2";
+        const NOW = Date.parse("2026-09-30T02:00:00Z");
+        const minutes = (from, to) => Array.from({ length: (to - from) / MIN }, (_, i) => from + i * MIN);
+        const localDays = (zone, firstDay, dayCount) =>
+            [moment.tz(firstDay, zone).valueOf(), moment.tz(firstDay, zone).add(dayCount, "day").valueOf()];
+
+        // One point per zone (a date-only end is inclusive, so 09-01..09-03 is three days): its own local days as 1-minute rows, plus a row 1 ms either side.
+        const fixture = (bneDays, nycDays) => {
+            const [bFrom, bTo] = localDays("Australia/Brisbane", ...bneDays);
+            const [nFrom, nTo] = localDays("America/New_York", ...nycDays);
+            return {
+                bounds: { bFrom, bTo, nFrom, nTo },
+                points: {
+                    [BNE]: { fqname: BNE_FQ, tz: "Brisbane", rows: [bFrom - 1, ...minutes(bFrom, bTo), bTo] },
+                    [NYC]: { fqname: NYC_FQ, tz: "New_York", rows: [nFrom - 1, ...minutes(nFrom, nTo), nTo] }
+                }
+            };
+        };
+
+        it("plans a date-only range in each point's own timezone", async () => {
+            const { bounds: b, points } = fixture(["2026-09-01", 3], ["2026-09-01", 3]);
+            const { ws, fake } = client(points);
+            const res = await ws.batch.hisDelete([BNE_FQ, NYC_FQ], "2026-09-01,2026-09-03");
+            expect(res.errors).to.eql([]);
+            expect(fake.rows(BNE)).to.eql([b.bFrom - 1, b.bTo]);
+            expect(fake.rows(NYC)).to.eql([b.nFrom - 1, b.nTo]);
+            expect(deletes(fake).length).to.be.greaterThan(1);
+        });
+
+        describe("relative ranges", () => {
+            let clock;
+            beforeEach(() => { clock = sinon.useFakeTimers({ now: NOW, toFake: ["Date"] }); });
+            afterEach(() => clock.restore());
+
+            it("plans yesterday in each point's own timezone", async () => {
+                const { bounds: b, points } = fixture(["2026-09-29", 1], ["2026-09-28", 1]);
+                const { ws, fake } = client(points);
+                const res = await ws.batch.hisDelete([BNE_FQ, NYC_FQ], "yesterday");
+                expect(res.errors).to.eql([]);
+                expect(fake.rows(BNE)).to.eql([b.bFrom - 1, b.bTo]);
+                expect(fake.rows(NYC)).to.eql([b.nFrom - 1, b.nTo]);
+                expect(deletes(fake).length).to.be.greaterThan(1);
+            });
+        });
+    });
+
     describe("failures", () => {
         const id = PT.chwFlowTemp;
         const day = () => ({ [id]: { rows: every("2026-09-01T00:00:00Z", 1440, MIN) } });

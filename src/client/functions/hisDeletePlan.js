@@ -376,19 +376,23 @@ function windowFor(parsed, zone, nowMs) {
  * Split ids by the raw Haystack `tz` tag of each point, keeping first-seen order. Each sub-group
  * carries that name (written after the offset of its converted range ends) and its IANA zone;
  * ids with no tz tag, or one that does not map to an IANA zone, get iana null.
+ * An id may be a uuid or an fqname (the server accepts both): the rows it returns carry the
+ * point's uuid `id` and an `fqname` tag, so each id is matched to its row by either.
  * @param {function(string[]): Promise<{rows: Object[]}>} readFn Reads the points by bare id.
- * @param {string[]} ids Point ids.
+ * @param {string[]} ids Point ids (uuid or fqname, in any form hisDelete accepts).
  * @returns {Promise<ZoneGroup[]>}
  */
 async function groupByZone(readFn, ids) {
     const grid = await readFn(ids.map(bareId));
-    const tzById = new Map();
+    const tzByKey = new Map();
     for (const row of lodash.get(grid, "rows", []) || []) {
-        if (row.id) tzById.set(bareId(row.id), row.tz ? String(row.tz).replace(/^s:/, "") : null);
+        const tz = row.tz ? String(row.tz).replace(/^s:/, "") : null;
+        if (row.id) tzByKey.set(bareId(row.id), tz);
+        if (row.fqname) tzByKey.set(String(row.fqname).replace(/^s:/, ""), tz);
     }
     const groups = new Map();
     for (const id of ids) {
-        const hsTz = tzById.get(bareId(id)) || null;
+        const hsTz = tzByKey.get(bareId(id)) || null;
         if (!groups.has(hsTz)) groups.set(hsTz, []);
         groups.get(hsTz).push(id);
     }
