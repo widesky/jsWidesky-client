@@ -72,11 +72,13 @@ function isRowsSorted(rows) {
  * @param batchSize Maximum size of each batch. For Objects, it's the number of key-value pairs found in the Object
  *                  of each attribute specified in the Object. For Arrays, its number of elements.
  * @param transformer A transformer for the batched arguments.
- * @returns {{p1, hasMore: (function(): boolean), getNext}}
+ * @returns {{count: number, hasMore: (function(): boolean), getNext}} count is the number of
+ *     requests the payload makes.
  */
 function createBatchIterator(op, payload, clientArgs, batchSize, transformer, batchSizeEntity) {
-    let hasMore, getNext, p1;
+    let hasMore, getNext, count;
     if (Array.isArray(payload)) {
+        count = Math.ceil(payload.length / batchSize);
         getNext = () => {
             const next = payload.splice(0, batchSize);
             if (op === "hisDelete") {
@@ -93,10 +95,6 @@ function createBatchIterator(op, payload, clientArgs, batchSize, transformer, ba
             }
         };
         hasMore = () => payload.length > 0;
-
-        if (this.isProgressEnabled) {
-            p1 = this.progressCreate(payload.length);
-        }
     } else if (typeof payload === "object") {
         // check if structure is as expected
         for (const [key, valueAsObject] of Object.entries(payload)) {
@@ -110,6 +108,7 @@ function createBatchIterator(op, payload, clientArgs, batchSize, transformer, ba
         const keyValueLength = payloadKeys.map((key) => Object.keys(payload[key]).length);
         const keyValueRemaining = [...keyValueLength];
         let currKeyIndex = 0;
+        count = countObjectRequests(keyValueLength, batchSize, entityCap);
         getNext = () => {
             // get next set using batchSize as maximum number of rows, not inclusive of the key,
             // and batchSizeEntity as maximum number of distinct top-level keys in the batch.
@@ -169,15 +168,120 @@ function createBatchIterator(op, payload, clientArgs, batchSize, transformer, ba
             }
             return currKeyIndex !== payloadKeys.length && keyValueLength[currKeyIndex] !== 0
         };
-
-        if (this.isProgressEnabled) {
-            p1 = this.progressCreate(Object.keys(payload).length);
-        }
     } else {
         throw new Error("First element of parameter should be of type Array or Object");
     }
 
-    return { hasMore, getNext, p1 };
+    return { hasMore, getNext, count };
+}
+
+/**
+ * The number of requests an Object payload makes, worked out from its row counts alone so that
+ * nothing is copied: the same packing as createBatchIterator's getNext.
+ * @param {number[]} lengths Rows under each top-level key, in key order.
+ * @param {number} batchSize Most rows in one request.
+ * @param {number} entityCap Most top-level keys in one request.
+ * @returns {number} The number of requests.
+ */
+function countObjectRequests(lengths, batchSize, entityCap) {
+    const remaining = [...lengths];
+    let index = 0;
+    let requests = 0;
+    const skipEmpty = () => {
+        while (index < remaining.length && remaining[index] === 0) index++;
+    };
+    skipEmpty();
+    while (index < remaining.length) {
+        let rows = 0;
+        let entities = 0;
+        while (rows < batchSize && entities < entityCap && index < remaining.length) {
+            if (remaining[index] === 0) {
+                index++;
+                continue;
+            }
+            const taken = Math.min(remaining[index], batchSize - rows);
+            remaining[index] -= taken;
+            rows += taken;
+            entities++;
+            if (remaining[index] === 0) index++;
+        }
+        requests++;
+        skipEmpty();
+    }
+    return requests;
+}
+
+/**
+ * Track the requests of one batch operation: log each as it completes, advance the progress
+ * counter, and log a summary when the operation ends.
+ * @param {string} label Operation name used in the log lines, e.g. "hisWrite".
+ * @param {number} total Requests the operation makes.
+ * @param {Object} [progress] Per-call progress reporter (cli-progress MultiBar interface, e.g.
+ *     RequestProgress); the client-wide `progress` configuration is used when absent.
+ * @param {Object} [payload] Details given to the counter when it is created.
+ * @param {string} unit What a request's size counts, for the log lines.
+ * @returns {{complete: function(Object): void, finish: function(): void}}
+ */
+function createRequestTracker(label, total, progress, payload, unit) {
+    const logger = this.logger;
+    let reporter = null;
+    if (progress && typeof progress.create === "function") {
+        reporter = { instance: progress, create: "create", increment: "increment" };
+    } else if (this.isProgressEnabled) {
+        const { instance, create, increment } = this.clientOptions.progress;
+        reporter = { instance, create, increment };
+    }
+    const bar = reporter ? reporter.instance[reporter.create](total, 0, { ...payload }) : null;
+    const started = Date.now();
+    let done = 0;
+    let failed = 0;
+    let size = 0;
+
+    return {
+        /**
+         * Record a completed request.
+         * @param {{ok: boolean, error?: string, size: number, retries: number, durationMs: number}} outcome
+         */
+        complete(outcome) {
+            done++;
+            size += outcome.size || 0;
+            if (!outcome.ok) failed++;
+            if (logger) {
+                const retries = outcome.retries === 1 ? "1 retry" : `${outcome.retries} retries`;
+                if (outcome.ok) {
+                    logger.debug("batch.%s: request %d/%d ok in %d ms, %s, %d %s",
+                        label, done, total, outcome.durationMs, retries, outcome.size, unit);
+                } else {
+                    logger.debug("batch.%s: request %d/%d failed in %d ms, %s: %s",
+                        label, done, total, outcome.durationMs, retries, outcome.error);
+                }
+            }
+            if (bar) {
+                bar[reporter.increment](1, {
+                    ok: outcome.ok,
+                    error: outcome.error,
+                    size: outcome.size,
+                    sizeDone: size,
+                    retries: outcome.retries,
+                    durationMs: outcome.durationMs,
+                    failed
+                });
+            }
+        },
+        /**
+         * Log the summary and release the progress counter.
+         */
+        finish() {
+            if (logger) {
+                logger.info("batch.%s: %d/%d requests done (%d failed), %d %s in %d ms",
+                    label, done, total, failed, size, unit, Date.now() - started);
+            }
+            if (bar) {
+                if (typeof bar.stop === "function") bar.stop();
+                if (typeof reporter.instance.remove === "function") reporter.instance.remove(bar);
+            }
+        }
+    };
 }
 
 /**
@@ -186,13 +290,27 @@ function createBatchIterator(op, payload, clientArgs, batchSize, transformer, ba
  * @param {Array} args Arguments to be called for the client operation.
  * @param {{retries: number, retryDelay: number}} retry Extra attempts after a transient failure (see
  *     batchRetry.withRetry) and the milliseconds before each. Only the final failure is reported.
+ * @param {number} size Items in the request.
+ * @param {Object} tracker The operation's request tracker (see createRequestTracker).
+ * @param {function(*): Object} [describe] Maps a response to outcome fields that override the
+ *     defaults, for an op that records its own failures (batch.hisDelete).
  * @returns {Promise<{res: *}|{error: {error: string, args: Array}}>} The response, or the error entry to report.
  *     Never rejects, so the caller can record outcomes in request order once a parallel group settles.
  */
-async function createBatchRequest(op, args, retry) {
+async function createBatchRequest(op, args, retry, size, tracker, describe) {
+    const started = Date.now();
+    let retries = 0;
+    const onRetry = () => {
+        retries++;
+    };
     try {
-        return { res: await withRetry(() => this[op](...args), retry) };
+        const res = await withRetry(() => this[op](...args), { ...retry, onRetry });
+        tracker.complete({
+            ok: true, size, retries, durationMs: Date.now() - started, ...(describe ? describe(res) : {})
+        });
+        return { res };
     } catch (error) {
+        tracker.complete({ ok: false, error: error.message, size, retries, durationMs: Date.now() - started });
         return { error: { error: error.message, args: [op, ...args] } };
     }
 }
@@ -213,6 +331,9 @@ async function createBatchRequest(op, args, retry) {
  *                           network error). 0 (default) disables retry.
  *                - retryDelay: Delay in milliseconds before each extra attempt.
  *                - transformer: A function to transform the payload to be passed to the client operation.
+ *                - progress: A progress reporter for this call (cli-progress MultiBar interface, e.g.
+ *                            RequestProgress). Its counter counts requests, advances as each completes and
+ *                            is removed when the operation ends. Defaults to the client-wide `progress`.
  * @returns {Promise<{success: Array, errors: Array<{errors: String, args: Array}>}>}
  *          - success: Contain the responses of successful operations when options.returnResult is true.
  *          - errors: Contain an errors encountered when performing operations.
@@ -232,6 +353,11 @@ async function performOpInBatch(op, args, options={}) {
     } = deriveFromDefaults(this.clientOptions.performOpInBatch, options);
 
     let { transformer } = options;
+    // label, unit, describe and progressPayload are internal: set by batch functions that wrap
+    // their own request runner (batch.hisDelete).
+    const { progress, describe, progressPayload } = options;
+    const label = options.label || op;
+    const unit = options.unit || "items";
     if (transformer == null) {
         // no transformation
         transformer = (val) => val;
@@ -247,44 +373,44 @@ async function performOpInBatch(op, args, options={}) {
         errors: [],
         success: []
     };
-    const { getNext, hasMore, p1 } = createBatchIterator.call(
+    const { getNext, hasMore, count } = createBatchIterator.call(
         this, op, payload, clientArgs, batchSize, transformer, batchSizeEntity
     );
     if (!hasMore()) {
         return result;
     }
 
-    let added = 0;
-    while (hasMore()) {
-        let sizeTotal = 0;
-        const requests = [];
+    const tracker = createRequestTracker.call(this, label, count, progress, progressPayload, unit);
+    try {
+        while (hasMore()) {
+            const requests = [];
 
-        // queue parallel requests
-        for (let i = 0; i < parallel && hasMore(); i++) {
-            const { next, size } = getNext();
-            sizeTotal += size;
-            requests.push(createBatchRequest.call(this, op, next, { retries, retryDelay }));
-            if (batchDelay > 0) {
-                await sleep(batchDelay);
+            // queue parallel requests
+            for (let i = 0; i < parallel && hasMore(); i++) {
+                const { next, size } = getNext();
+                requests.push(createBatchRequest.call(
+                    this, op, next, { retries, retryDelay }, size, tracker, describe
+                ));
+                if (batchDelay > 0) {
+                    await sleep(batchDelay);
+                }
+            }
+            // Record in request order, not completion order: a retried request finishes after its peers,
+            // and hisRead / multiFind read success by position.
+            for (const outcome of await Promise.all(requests)) {
+                if (outcome.error) {
+                    result.errors.push(outcome.error);
+                } else if (returnResult) {
+                    result.success.push(outcome.res);
+                }
+            }
+
+            if (parallelDelay > 0)  {
+                await sleep(parallelDelay);
             }
         }
-        // Record in request order, not completion order: a retried request finishes after its peers,
-        // and hisRead / multiFind read success by position.
-        for (const outcome of await Promise.all(requests)) {
-            if (outcome.error) {
-                result.errors.push(outcome.error);
-            } else if (returnResult) {
-                result.success.push(outcome.res);
-            }
-        }
-
-        if (this.isProgressEnabled) {
-            p1[this.clientOptions.progress.update](added += sizeTotal);
-        }
-
-        if (parallelDelay > 0)  {
-            await sleep(parallelDelay);
-        }
+    } finally {
+        tracker.finish();
     }
 
     return result;
@@ -598,23 +724,37 @@ async function hisDelete(ids, range, endOrOptions, maybeOptions) {
         }
     }
 
+    // Resolves to the request's outcome for progress reporting: ok, the retries used (including
+    // any bisected halves') and, on failure, the last error.
     const runRequest = async (req) => {
+        let retriesUsed = 0;
+        const onRetry = () => {
+            retriesUsed++;
+        };
         try {
-            const res = await withRetry(() => this.hisDelete(req.ids, req.range), { retries, retryDelay });
+            const res = await withRetry(() => this.hisDelete(req.ids, req.range), { retries, retryDelay, onRetry });
             if (returnResult) {
                 success.push(res);
             }
+            return { ok: true, retries: retriesUsed };
         } catch (error) {
             const halves = isRecordLimitError(error) && req.depth < maxBisectDepth ? splitRequest(req) : null;
             if (halves) {
                 this.logger.warn("batch.hisDelete: record limit hit for %s; bisecting (depth %d/%d)",
                     req.range, req.depth + 1, maxBisectDepth);
+                const outcome = { ok: true, retries: retriesUsed };
                 for (const half of halves) {
-                    await runRequest(half);
+                    const halfOutcome = await runRequest(half);
+                    outcome.retries += halfOutcome.retries;
+                    if (!halfOutcome.ok) {
+                        outcome.ok = false;
+                        outcome.error = halfOutcome.error;
+                    }
                 }
-                return;
+                return outcome;
             }
             errors.push({ error: error.message, args: ["hisDelete", req.ids, req.range] });
+            return { ok: false, retries: retriesUsed, error: error.message };
         }
     };
 
@@ -623,7 +763,7 @@ async function hisDelete(ids, range, endOrOptions, maybeOptions) {
     // client-wide performOpInBatch.retries from retrying on top). The receiver is a stand-in so
     // the dispatch name never lands on the shared client instance.
     const runner = Object.create(this);
-    runner.runHisDeleteRequest = runRequest;
+    runner.runHisDeleteRequest = async (req) => ({ ...(await runRequest(req)), size: req.rows || 0 });
     await this.performOpInBatch.call(runner, "runHisDeleteRequest", [[...requests]], {
         batchSize: 1,
         transformer: (batch) => batch[0],
@@ -631,7 +771,13 @@ async function hisDelete(ids, range, endOrOptions, maybeOptions) {
         batchDelay: resolved.batchDelay,
         parallelDelay: resolved.parallelDelay,
         returnResult: false,
-        retries: 0
+        retries: 0,
+        progress: options.progress,
+        label: "hisDelete",
+        unit: "rows",
+        progressPayload: { rowsTotal: requests.reduce((n, req) => n + (req.rows || 0), 0) },
+        // runRequest records its own failures and retries; report them per request.
+        describe: ({ ok, error, retries: retriesUsed, size }) => ({ ok, error, retries: retriesUsed, size })
     });
 
     return { success, errors };

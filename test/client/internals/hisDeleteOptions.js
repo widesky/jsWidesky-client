@@ -21,7 +21,7 @@ describe("client batch.hisDelete options", () => {
     });
 
     it("advertises the planner so callers can detect support", () => {
-        expect(make().features).to.eql({ hisDeletePlanner: true });
+        expect(make().features).to.eql({ hisDeletePlanner: true, batchProgress: true });
         expect(Object.isFrozen(make().features)).to.be.true;
     });
 

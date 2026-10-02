@@ -76,16 +76,20 @@ function isRecordLimitError(err) {
  * @param {Object} options Retry options.
  * @param {number} [options.retries] Extra attempts after the first (0, null or absent disables retry).
  * @param {number} options.retryDelay Milliseconds to wait before each extra attempt.
+ * @param {function(*): void} [options.onRetry] Called with the error before each extra attempt.
  * @returns {Promise<T>} What `fn` resolves to.
  * @throws {*} The last error when attempts run out or the error is not retryable.
  */
-async function withRetry(fn, { retries, retryDelay }) {
+async function withRetry(fn, { retries, retryDelay, onRetry }) {
     for (let attempt = 0; ; attempt++) {
         try {
             return await fn();
         } catch (err) {
             if (attempt >= (retries ?? 0) || !isRetryable(err) || isRecordLimitError(err)) {
                 throw err;
+            }
+            if (onRetry) {
+                onRetry(err);
             }
             if (retryDelay > 0) {
                 await sleep(retryDelay);

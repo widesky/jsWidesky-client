@@ -17,6 +17,7 @@
   - [Path `client.batch.updateOrCreate`](#path-clientbatchupdateorcreate)
   - [Path `client.batch.multiFind`](#path-clientbatchmultifind)
   - [Retries](#retries)
+  - [Progress and logging](#progress-and-logging)
 
 <!-- tocstop -->
 
@@ -40,7 +41,8 @@ The `batch` property of the `options` argument used in `WideSkyClient` is expect
 | `updateOrCreate`         | Define the default batch configurations for this functions. | Object |   As per the table of configurations for `client.batch.updateOrCreate`    |
 
 Every batch operation accepts `retries` and `retryDelay`, in its client configuration or in the options of the call.
-See [Retries](#retries).
+See [Retries](#retries). Every batch operation also accepts a `progress` reporter in the options of the call; see
+[Progress and logging](#progress-and-logging).
 
 ### Path `client.batch.hisRead`
 The Object in `client.batch.hisRead` is expected to have the following structure:
@@ -380,3 +382,57 @@ defaults. `performOpInBatch` called directly also takes them, defaulting to `cli
 `client.batch.<operation>`.
 `batch.hisDelete` and `batch.hisDeleteByFilter` retry their own count queries, timezone reads and deletes (see
 [Failures and retries](#failures-and-retries)).
+
+### Progress and logging
+Each batch operation counts the requests it sends and reports each one as it completes.
+Clients with this behaviour have `client.features.batchProgress === true`.
+
+**Progress.** Pass a progress reporter as the `progress` option of the call, or configure one client-wide with
+[`client.progress`](options.md#path-clientprogress); the call's reporter wins. A reporter implements the subset of the
+cli-progress `MultiBar` interface the client uses: `create(total, value, payload)` returning a counter with
+`increment(delta, payload)` and `stop()`, and optionally `remove(counter)`. For each operation the client creates one
+counter whose total is the number of requests, increments it by 1 as each request completes (not once per parallel
+group), then stops and removes it, so one reporter can be reused for any number of calls. Each increment's payload
+carries:
+
+| Payload key  | Description                                                                 |
+|--------------|-----------------------------------------------------------------------------|
+| `ok`         | Whether the request succeeded.                                              |
+| `error`      | The error message of a failed request.                                      |
+| `size`       | Items in the request; for `batch.hisDelete`, the rows it was planned to hold. |
+| `sizeDone`   | Items (rows for `batch.hisDelete`) in the requests completed so far.        |
+| `retries`    | Extra attempts the request needed.                                          |
+| `durationMs` | Time the request took, retries included.                                    |
+| `failed`     | Requests failed so far.                                                     |
+
+`batch.hisDelete` (and `batch.hisDeleteByFilter`) count the planned delete requests and create the counter with the
+payload `{ rowsTotal }`, the rows the plan will delete. A request the server halves for its record limit still counts
+as one request. Nothing is reported while the deletes are being planned, or when nothing is to be deleted.
+
+`RequestProgress`, exported by the package, is a reporter that writes one plain line per change, through a writer
+that also receives the counter, so a caller can log the line or build its own display from the counter's `value`,
+`getTotal()` and `payload`:
+
+```javascript
+const { RequestProgress } = require("@widesky/jswidesky-client");
+
+const progress = new RequestProgress({
+    label: "hisDelete",
+    write: (line, counter) => console.log(line, counter.payload.sizeDone || 0, "of", counter.payload.rowsTotal, "rows")
+});
+await client.batch.hisDelete(ids, "s:2026-09-01,2026-09-04", { progress });
+// [hisDelete #1] 0% | 0/12 0 of 13557 rows
+// [hisDelete #1] 8% | 1/12 1131 of 13557 rows
+// ...
+// [hisDelete #1] 100% | 12/12 | done 13557 of 13557 rows
+```
+
+**Logging.** Each completed request is logged at `debug` level, with its number, duration, retries and size, or its
+error. Each operation ends with one `info` line: the requests done, how many failed, the items (rows for
+`batch.hisDelete`) sent and the total time. For example:
+
+```
+batch.hisDelete: request 3/12 ok in 184 ms, 0 retries, 1131 rows
+batch.hisDelete: request 4/12 failed in 2210 ms, 1 retry: Internal Server Error
+batch.hisDelete: 12/12 requests done (1 failed), 13557 rows in 4120 ms
+```

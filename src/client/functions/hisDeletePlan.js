@@ -644,7 +644,12 @@ async function planGroup(countFn, ids, parsed, window, { batchSize, countBucketU
         return { overBudget: `a request would hold ${worst} rows, more than batchSize (${batchSize}) rows, ` +
             "because no cut can be placed where they fall (a repeated daylight-saving hour)" };
     }
-    return { requests: buildRequests(ids, parsed, window, boundaries) };
+    const requests = buildRequests(ids, parsed, window, boundaries);
+    // Planned rows per request, for progress reporting: requests line up with totals.
+    requests.forEach((req, i) => {
+        req.rows = totals[i];
+    });
+    return { requests };
 }
 
 /**
