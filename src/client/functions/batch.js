@@ -226,16 +226,33 @@ function createRequestTracker(label, total, progress, payload, unit) {
     const logger = this.logger;
     let reporter = null;
     if (progress && typeof progress.create === "function") {
-        reporter = { instance: progress, create: "create", increment: "increment" };
+        reporter = { instance: progress, create: "create", increment: "increment", update: "update" };
     } else if (this.isProgressEnabled) {
-        const { instance, create, increment } = this.clientOptions.progress;
-        reporter = { instance, create, increment };
+        const { instance, create, increment, update } = this.clientOptions.progress;
+        reporter = { instance, create, increment, update };
     }
-    const bar = reporter ? reporter.instance[reporter.create](total, 0, { ...payload }) : null;
+    // A reporter is the caller's code: a failure in it is logged once and never changes the
+    // result of the batch operation.
+    let reporterFailed = false;
+    const report = (what, fn) => {
+        if (reporterFailed) return undefined;
+        try {
+            return fn();
+        } catch (error) {
+            reporterFailed = true;
+            if (logger) {
+                logger.warn("batch.%s: progress reporter failed on %s, not reporting further: %s",
+                    label, what, error.message);
+            }
+            return undefined;
+        }
+    };
+    const bar = reporter ? report("create", () => reporter.instance[reporter.create](total, 0, { ...payload })) : null;
     const started = Date.now();
     let done = 0;
     let failed = 0;
     let size = 0;
+    let sizeOk = 0;
 
     return {
         /**
@@ -245,7 +262,11 @@ function createRequestTracker(label, total, progress, payload, unit) {
         complete(outcome) {
             done++;
             size += outcome.size || 0;
-            if (!outcome.ok) failed++;
+            if (outcome.ok) {
+                sizeOk += outcome.size || 0;
+            } else {
+                failed++;
+            }
             if (logger) {
                 const retries = outcome.retries === 1 ? "1 retry" : `${outcome.retries} retries`;
                 if (outcome.ok) {
@@ -257,14 +278,23 @@ function createRequestTracker(label, total, progress, payload, unit) {
                 }
             }
             if (bar) {
-                bar[reporter.increment](1, {
+                const details = {
                     ok: outcome.ok,
                     error: outcome.error,
                     size: outcome.size,
                     sizeDone: size,
+                    sizeOk,
                     retries: outcome.retries,
                     durationMs: outcome.durationMs,
                     failed
+                };
+                report("increment", () => {
+                    // Counters that only implement update (the earlier client-wide contract).
+                    if (typeof bar[reporter.increment] === "function") {
+                        bar[reporter.increment](1, details);
+                    } else {
+                        bar[reporter.update](done, details);
+                    }
                 });
             }
         },
@@ -277,8 +307,21 @@ function createRequestTracker(label, total, progress, payload, unit) {
                     label, done, total, failed, size, unit, Date.now() - started);
             }
             if (bar) {
-                if (typeof bar.stop === "function") bar.stop();
-                if (typeof reporter.instance.remove === "function") reporter.instance.remove(bar);
+                // Released even after the reporter failed, so a reused reporter keeps no counter.
+                try {
+                    report("stop", () => {
+                        if (typeof bar.stop === "function") bar.stop();
+                    });
+                } finally {
+                    try {
+                        if (typeof reporter.instance.remove === "function") reporter.instance.remove(bar);
+                    } catch (error) {
+                        if (logger) {
+                            logger.warn("batch.%s: progress reporter failed to remove its counter: %s",
+                                label, error.message);
+                        }
+                    }
+                }
             }
         }
     };
@@ -303,16 +346,20 @@ async function createBatchRequest(op, args, retry, size, tracker, describe) {
     const onRetry = () => {
         retries++;
     };
+    let outcome;
     try {
-        const res = await withRetry(() => this[op](...args), { ...retry, onRetry });
-        tracker.complete({
-            ok: true, size, retries, durationMs: Date.now() - started, ...(describe ? describe(res) : {})
-        });
-        return { res };
+        outcome = { res: await withRetry(() => this[op](...args), { ...retry, onRetry }) };
     } catch (error) {
-        tracker.complete({ ok: false, error: error.message, size, retries, durationMs: Date.now() - started });
-        return { error: { error: error.message, args: [op, ...args] } };
+        outcome = { error: { error: error.message, args: [op, ...args] } };
     }
+    // Reported outside the request's try: only the request decides its outcome.
+    const durationMs = Date.now() - started;
+    if (outcome.error) {
+        tracker.complete({ ok: false, error: outcome.error.error, size, retries, durationMs });
+    } else {
+        tracker.complete({ ok: true, size, retries, durationMs, ...(describe ? describe(outcome.res) : {}) });
+    }
+    return outcome;
 }
 
 /**
@@ -369,12 +416,16 @@ async function performOpInBatch(op, args, options={}) {
     }
     const payload = args[0];
     const clientArgs = args.slice(1);
+    // Whole numbers of items and entities per request: the schema accepts fractions, which the
+    // Array and Object iterators would otherwise round differently from the request count.
+    const wholeBatchSize = Math.floor(batchSize);
+    const wholeBatchSizeEntity = batchSizeEntity == null ? batchSizeEntity : Math.floor(batchSizeEntity);
     const result = {
         errors: [],
         success: []
     };
     const { getNext, hasMore, count } = createBatchIterator.call(
-        this, op, payload, clientArgs, batchSize, transformer, batchSizeEntity
+        this, op, payload, clientArgs, wholeBatchSize, transformer, wholeBatchSizeEntity
     );
     if (!hasMore()) {
         return result;

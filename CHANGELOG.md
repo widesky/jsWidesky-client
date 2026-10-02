@@ -14,6 +14,8 @@ This project adheres to [Semantic Versioning](http://semver.org/).
 
 ### Changed
 - [CORE-9592](https://widesky.atlassian.net/browse/CORE-9592): Client-wide `progress` counters now count requests, advance as each request completes and are removed when the operation ends.
+  - With cli-progress, a finished bar is cleared from the terminal.
+  - A fractional `batchSize` or `batchSizeEntity` is rounded down to a whole number of items or entities per request.
 - [CORE-9209](https://widesky.atlassian.net/browse/CORE-9209): `batch.hisDelete` sizes deletes from server-side record counts instead of reading every row first, and accepts a Haystack range string as well as two Dates.
   - A request now holds at most 500 rows in total across at most 10 points (was 1500 rows per point / 100 points).
   - Requests rejected for the per-point record limit are halved and retried, up to `maxBisectDepth` times.

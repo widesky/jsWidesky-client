@@ -286,10 +286,11 @@ class RequestProgress {
         this.#created++;
         const bar = new RequestProgressBar(
             this, `${this.#options.label} #${this.#created}`, total, value, payload);
-        this.#bars.push(bar);
+        // Reported before it is kept, so a writer that throws here leaves no counter behind.
         if (this.#options.reportOnCreate) {
             bar.update(value);
         }
+        this.#bars.push(bar);
 
         return bar;
     }

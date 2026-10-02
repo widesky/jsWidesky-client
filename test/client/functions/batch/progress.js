@@ -24,9 +24,9 @@ const every = (fromIso, count, stepMs) => Array.from({ length: count }, (_, i) =
  * @returns {{ws: Object, logger: Object, sent: Array, failNext: function(function, Error): void}} failNext's
  *     matcher gets the 1-based number of the request (attempts included).
  */
-function hisWriteClient() {
+function hisWriteClient(clientOptions) {
     const logger = new stubs.StubLogger();
-    const ws = stubs.getInstance(new stubs.StubHTTPClient(), logger, {});
+    const ws = stubs.getInstance(new stubs.StubHTTPClient(), logger, clientOptions ? { clientOptions } : {});
     const sent = [];
     const faults = [];
     ws._wsRawSubmit = sinon.stub().callsFake(async (method, uri, body) => {
@@ -152,8 +152,77 @@ describe("client batch operations: progress and request logging", () => {
             const updates = lines.slice(1).map((l) => l.payload);
             expect(updates.map((p) => [p.ok, p.retries, p.failed])).to.eql([[true, 1, 0], [false, 0, 1]]);
             expect(updates[1].error).to.contain("Invalid timestamp");
+            // Rows of the failed request count as done but not as written.
+            expect(updates[1]).to.include({ sizeDone: 20, sizeOk: 10 });
             expect(debugLines(logger)).to.include("batch.%s: request %d/%d failed in %d ms, %s: %s");
             expect(infoCalls(logger)[0].slice(1, 5)).to.eql(["hisWrite", 2, 2, 1]);
+        });
+
+        it("is not affected by a progress writer that throws, and still removes its counter", async () => {
+            const { ws, logger, sent } = hisWriteClient();
+            const progress = new RequestProgress({
+                write: () => {
+                    throw new Error("status display unavailable");
+                }
+            });
+
+            const res = await ws.batch.hisWrite(chillerSamples([CHILLER.chwSupplyTemp], 40), {
+                batchSize: 10, parallel: 2, returnResult: true, progress
+            });
+
+            expect(res.errors).to.eql([]);
+            expect(res.success).to.have.length(4);
+            expect(sent).to.have.length(4);
+            expect(progress.bars).to.eql([]);
+            const warnings = logger.warn.args.filter((a) => /progress reporter failed/.test(a[0]));
+            expect(warnings).to.have.length(1);
+            expect(warnings[0]).to.include("status display unavailable");
+        });
+
+        it("drives a client-wide reporter whose counters only have update", async () => {
+            const bar = { update: sinon.stub(), stop: sinon.stub() };
+            const instance = { create: sinon.stub().returns(bar) };
+            const { ws, sent } = hisWriteClient({ progress: { enable: true, instance } });
+
+            const res = await ws.batch.hisWrite(chillerSamples([CHILLER.chwSupplyTemp], 30), { batchSize: 10 });
+
+            expect(res.errors).to.eql([]);
+            expect(instance.create.args[0].slice(0, 2)).to.eql([sent.length, 0]);
+            expect(bar.update.args.map((a) => a[0])).to.eql([1, 2, 3]);
+            expect(bar.stop.calledOnce).to.equal(true);
+        });
+
+        it("advances once per request with parallel requests, ending at the request count", async () => {
+            const { ws, sent } = hisWriteClient();
+            const { progress, lines } = recordedProgress("hisWrite");
+
+            await ws.batch.hisWrite(chillerSamples([CHILLER.chwSupplyTemp, CHILLER.chwReturnTemp], 35), {
+                batchSize: 10, parallel: 3, progress
+            });
+
+            expect(sent).to.have.length(7);
+            expect(lines.map((l) => l.value)).to.eql([0, 1, 2, 3, 4, 5, 6, 7]);
+            expect(lines.at(-1).payload).to.include({ sizeDone: 70, sizeOk: 70 });
+        });
+
+        it("counts the requests sent for a fractional batch size", async () => {
+            for (const shape of [
+                { op: "create", payload: () => [1, 2, 3, 4, 5].map((n) => ({ dis: `s:Chiller-0${n}`, equip: "m:" })) },
+                { op: "hisWrite", payload: () => chillerSamples([CHILLER.chwSupplyTemp, CHILLER.chwReturnTemp], 3) },
+            ]) {
+                const { ws, sent } = hisWriteClient();
+                ws._wsRawSubmit.callsFake(async (method, uri, body) => {
+                    if (uri === "/oauth2/token") {
+                        return { access_token: "a", refresh_token: "r", expires_in: Date.now() + 3600000 };
+                    }
+                    sent.push(body.rows);
+                    return { meta: { ver: "2.0" }, cols: [{ name: "id" }], rows: body.rows };
+                });
+                const { progress, lines } = recordedProgress(shape.op);
+                await ws.batch[shape.op](shape.payload(), { batchSize: 2.5, progress });
+                expect(lines[0].total, shape.op).to.equal(sent.length);
+                expect(lines.at(-1).line, shape.op).to.match(/\| done$/);
+            }
         });
 
         it("removes its counter when the operation ends, so one reporter serves many calls", async () => {

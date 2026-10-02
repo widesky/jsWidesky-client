@@ -390,7 +390,9 @@ Clients with this behaviour have `client.features.batchProgress === true`.
 **Progress.** Pass a progress reporter as the `progress` option of the call, or configure one client-wide with
 [`client.progress`](options.md#path-clientprogress); the call's reporter wins. A reporter implements the subset of the
 cli-progress `MultiBar` interface the client uses: `create(total, value, payload)` returning a counter with
-`increment(delta, payload)` and `stop()`, and optionally `remove(counter)`. For each operation the client creates one
+`increment(delta, payload)` (or `update(value, payload)`) and `stop()`, and optionally `remove(counter)`. A reporter
+that throws is logged at `warn` level once and not called again for that operation; it never changes the operation's
+result. For each operation the client creates one
 counter whose total is the number of requests, increments it by 1 as each request completes (not once per parallel
 group), then stops and removes it, so one reporter can be reused for any number of calls. Each increment's payload
 carries:
@@ -400,14 +402,16 @@ carries:
 | `ok`         | Whether the request succeeded.                                              |
 | `error`      | The error message of a failed request.                                      |
 | `size`       | Items in the request; for `batch.hisDelete`, the rows it was planned to hold. |
-| `sizeDone`   | Items (rows for `batch.hisDelete`) in the requests completed so far.        |
+| `sizeDone`   | Items (rows for `batch.hisDelete`) in the requests completed so far, failed ones included. |
+| `sizeOk`     | Items (rows for `batch.hisDelete`) in the requests that succeeded so far.   |
 | `retries`    | Extra attempts the request needed.                                          |
 | `durationMs` | Time the request took, retries included.                                    |
 | `failed`     | Requests failed so far.                                                     |
 
 `batch.hisDelete` (and `batch.hisDeleteByFilter`) count the planned delete requests and create the counter with the
 payload `{ rowsTotal }`, the rows the plan will delete. A request the server halves for its record limit still counts
-as one request. Nothing is reported while the deletes are being planned, or when nothing is to be deleted.
+as one request. Nothing is reported while the deletes are being planned, or when no request is planned (every group
+was not sent or failed to plan). A point with no rows in the range still gets a planned request.
 
 `RequestProgress`, exported by the package, is a reporter that writes one plain line per change, through a writer
 that also receives the counter, so a caller can log the line or build its own display from the counter's `value`,
@@ -418,7 +422,7 @@ const { RequestProgress } = require("@widesky/jswidesky-client");
 
 const progress = new RequestProgress({
     label: "hisDelete",
-    write: (line, counter) => console.log(line, counter.payload.sizeDone || 0, "of", counter.payload.rowsTotal, "rows")
+    write: (line, counter) => console.log(line, counter.payload.sizeOk || 0, "of", counter.payload.rowsTotal, "rows")
 });
 await client.batch.hisDelete(ids, "s:2026-09-01,2026-09-04", { progress });
 // [hisDelete #1] 0% | 0/12 0 of 13557 rows
