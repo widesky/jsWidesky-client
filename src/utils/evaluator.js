@@ -7,8 +7,10 @@ const HIS_WRITE_BATCH_SIZE  = 10000;
 const HIS_WRITE_BATCH_SIZE_MAX = 20000;
 const HIS_WRITE_ENTITY_BATCH_SIZE = 100;
 const HIS_WRITE_ENTITY_BATCH_SIZE_MAX = 1000;
-// Total rows per request, summed over its points. 500 keeps every request well under the API
-// server's 1500 rows-per-entity reject threshold.
+// hisDelete budget: rows per request summed over ALL its points, not per point. Deliberately
+// conservative: it bounds the work (and InfluxDB load) of each delete request, and so stays well
+// under the API server's 1500 rows-per-entity reject threshold whatever the mix of points. The
+// cost is more count queries and deletes for large deletes; sites can raise batchSize (max 3000).
 const HIS_DELETE_DATA_POINT_BATCH_SIZE = 500;
 const HIS_DELETE_DATA_POINT_BATCH_SIZE_MAX = 3000;
 const HIS_DELETE_ENTITY_BATCH_SIZE = 10;
