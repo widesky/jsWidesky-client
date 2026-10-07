@@ -96,6 +96,9 @@ function parseRange(range) {
     return { start, end };
 }
 
+// Entities the API server's GraphQL search returns when the query gives no limit.
+const SEARCH_DEFAULT_LIMIT = 30;
+
 /**
  * In-memory WideSky history server installed at the client's raw HTTP seam (_wsRawSubmit).
  * It stores rows per point, answers the planner's GraphQL COUNT histograms from them and applies
@@ -194,16 +197,19 @@ class FakeHistoryServer {
     }
 
     parseCount(query) {
-        const [, filter] = query.match(/search\(filter: "([^"]*)"\)/);
+        const [, filter, limit] = query.match(/search\(filter: "([^"]*)"(?:, limit: (\d+))?\)/);
         const term = [UUID_RE, ...this.byFqname.keys()].map((x) => (x === UUID_RE ? x : escapeRe(x))).join("|");
         const filterRe = new RegExp(`^id==@(?:${term})(?: or id==@(?:${term}))*$`);
         const ids = filterRe.test(filter) ? [...filter.matchAll(/id==@([^\s]+)/g)].map((m) => m[1]) : null;
         const [, start, end] = query.match(/start: "([^"]+)", end: "([^"]+)"/);
         const [, unit] = query.match(/groupByUnits: (\w+)/);
-        return { uri: "/graphql", ids: ids || [], badFilter: ids ? null : filter, fromMs: Date.parse(start), toMs: Date.parse(end), unit };
+        return {
+            uri: "/graphql", ids: ids || [], badFilter: ids ? null : filter, fromMs: Date.parse(start), toMs: Date.parse(end), unit,
+            limit: limit === undefined ? undefined : Number(limit)
+        };
     }
 
-    count({ ids, badFilter, fromMs, toMs, unit }) {
+    count({ ids, badFilter, fromMs, toMs, unit, limit }) {
         if (badFilter !== null) {
             return { errors: [{ message: `Invalid filter: ${badFilter}` }] };
         }
@@ -212,7 +218,10 @@ class FakeHistoryServer {
             return { errors: [{ message: `COUNT range start ${new Date(fromMs).toISOString()} is not before end ${new Date(toMs).toISOString()}` }] };
         }
         const size = UNIT_MS[unit];
-        const entity = ids.map((id) => this.lookup(id)).filter((id) => id !== null).map((id) => {
+        // Like the API server's GraphQL search: 30 entities unless a limit is given; 0 means all.
+        const found = ids.map((id) => this.lookup(id)).filter((id) => id !== null);
+        const cap = limit === undefined ? SEARCH_DEFAULT_LIMIT : limit === 0 ? Infinity : limit;
+        const entity = found.slice(0, cap).map((id) => {
             const buckets = new Map();
             for (const ts of this.points.get(id).rows) {
                 if (ts < fromMs || ts >= toMs) continue;
