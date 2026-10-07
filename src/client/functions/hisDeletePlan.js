@@ -409,7 +409,9 @@ async function groupByZone(readFn, ids) {
  */
 function buildCountQuery(ids, fromMs, toMs, unit) {
     const filter = ids.map((id) => `id==@${bareId(id)}`).join(" or ");
-    return `haystack { search(filter: "${filter}") { entity { id ` +
+    // limit: 0 returns every matching entity; without it the API server stops at 30, and a larger
+    // group would be undercounted and sent as too few requests.
+    return `haystack { search(filter: "${filter}", limit: 0) { entity { id ` +
         `history(rangeAbsolute: {start: "${toIso(fromMs)}", end: "${toIso(toMs)}"}) { ` +
         `aggregate(function: COUNT, allEntities: false, ` +
         `groupBy: {groupByUnits: ${unit}, groupBySize: 1, fill: NONE}) { ` +

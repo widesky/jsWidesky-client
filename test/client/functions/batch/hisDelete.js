@@ -221,6 +221,35 @@ describe("client.batch.hisDelete", () => {
         expect(fake.rows(PT.chwFlowTemp)).to.eql([]);
         expect(deletes(fake)).to.have.length(2);
     });
+
+    describe("groups of more than 30 points", () => {
+        // 40 chilled-water meter points, as a site with a 100-point entity batch would group them.
+        // Only points 31-40 have rows: the API server's search returns 30 entities unless asked
+        // for more, so a count without a limit would miss every row here.
+        const METERS = Array.from({ length: 40 }, (_, i) =>
+            `7b2e9c40-1d5a-4f3b-8e62-0a9c3d5e${String(i + 1).padStart(4, "0")}`);
+        const LOGGING = METERS.slice(30);
+
+        it("counts every point of the group and keeps each request within the row budget", async () => {
+            const points = Object.fromEntries(METERS.map((id) => [id, {
+                rows: LOGGING.includes(id) ? every("2026-09-01T00:00:00Z", 3 * 1440, MIN) : []
+            }]));
+            const { ws, fake } = client(points);
+
+            const res = await ws.batch.hisDelete(METERS, RANGE, { batchSizeEntity: 40 });
+
+            expect(res.errors).to.eql([]);
+            for (const id of LOGGING) {
+                expect(fake.rows(id), id).to.eql([]);
+            }
+            // Every count asked about all 40 points of the group.
+            expect(counts(fake).every((r) => r.ids.length === 40)).to.equal(true);
+            const sizes = deletes(fake).map((r) => r.deleted.reduce((a, b) => a + b, 0));
+            expect(sizes.reduce((a, b) => a + b, 0)).to.equal(10 * 3 * 1440);
+            expect(Math.max(...sizes)).to.be.at.most(500);
+        });
+    });
+
     describe("ranges without an offset", () => {
         const BNE = "b1e2c3d4-0000-4a5b-8c9d-0000000000b1";   // tz Brisbane, UTC+10
         const NYC = "e5f6a7b8-0000-4a5b-8c9d-0000000000e5";   // tz New_York, UTC-4 in September
