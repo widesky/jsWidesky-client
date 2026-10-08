@@ -293,7 +293,7 @@ function createProgressCounter(label, total, progress, payload) {
 /**
  * Track the requests of one batch operation: log each as it is sent (trace), retried (debug) and
  * completed (debug), advance the progress counter, and log a summary when the operation ends
- * (info).
+ * (debug).
  * @param {string} label Operation name used in the log lines, e.g. "hisWrite".
  * @param {number} total Requests the operation makes.
  * @param {Object} [progress] Per-call progress reporter; see createProgressCounter.
@@ -373,7 +373,7 @@ function createRequestTracker(label, total, progress, payload, unit) {
          */
         finish() {
             if (logger) {
-                logger.info("batch.%s: %d/%d requests done (%d failed), %d %s in %d ms",
+                logger.debug("batch.%s: %d/%d requests done (%d failed), %d %s in %d ms",
                     label, done, total, failed, size, unit, Date.now() - started);
             }
             counter.release();
@@ -491,7 +491,9 @@ async function performOpInBatch(op, args, options={}) {
 
     // A wrapping batch function (batch.hisDelete) counts its own rows: its payload is requests.
     const itemTotal = unit === "items" ? items : (progressPayload && progressPayload.rowsTotal) || 0;
-    this.logger.info("batch.%s: sending %d requests, %d %s (batch size %d, parallel %d, delay %d ms, " +
+    // Start and summary are debug, not info: batch operations run all day on edge engines (every
+    // history write), whose client logs at info by default.
+    this.logger.debug("batch.%s: sending %d requests, %d %s (batch size %d, parallel %d, delay %d ms, " +
         "retries %d)", label, count, itemTotal, unit, wholeBatchSize, parallel, batchDelay || 0, retries || 0);
     const tracker = createRequestTracker.call(this, label, count, progress, progressPayload, unit);
     let sentCount = 0;

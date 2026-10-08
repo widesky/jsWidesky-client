@@ -79,7 +79,8 @@ function recordedProgress(label) {
 
 const debugLines = (logger) => logger.debug.args.map((a) => a[0]);
 const SUMMARY = "batch.%s: %d/%d requests done (%d failed), %d %s in %d ms";
-const infoCalls = (logger) => logger.info.args.filter((a) => a[0] === SUMMARY);
+// The per-operation summary is logged at debug (start and summary run on every history write).
+const summaryCalls = (logger) => logger.debug.args.filter((a) => a[0] === SUMMARY);
 // The delete counter's lines; batch.hisDelete reports planning on a counter before it.
 const deleting = (lines) => lines.filter((l) => l.payload.phase === "deleting");
 
@@ -134,7 +135,7 @@ describe("client batch operations: progress and request logging", () => {
             ]);
             expect(requestLogs.every((a) => Number.isInteger(a[4]) && a[4] >= 0)).to.equal(true);
             expect(sent).to.have.length(3);
-            const [summary] = infoCalls(logger);
+            const [summary] = summaryCalls(logger);
             expect(summary.slice(0, 7)).to.eql([
                 "batch.%s: %d/%d requests done (%d failed), %d %s in %d ms", "hisWrite", 3, 3, 0, 30, "items"
             ]);
@@ -158,7 +159,7 @@ describe("client batch operations: progress and request logging", () => {
             // Rows of the failed request count as done but not as written.
             expect(updates[1]).to.include({ sizeDone: 20, sizeOk: 10 });
             expect(debugLines(logger)).to.include("batch.%s: request %d/%d failed in %d ms, %s: %s");
-            expect(infoCalls(logger)[0].slice(1, 5)).to.eql(["hisWrite", 2, 2, 1]);
+            expect(summaryCalls(logger)[0].slice(1, 5)).to.eql(["hisWrite", 2, 2, 1]);
         });
 
         it("is not affected by a progress writer that throws, and still removes its counter", async () => {
@@ -334,7 +335,7 @@ describe("client batch operations: progress and request logging", () => {
             const failedLog = logger.debug.args.find((a) => a[0] === "batch.%s: request %d/%d failed in %d ms, %s: %s");
             expect(failedLog[1]).to.equal("hisDelete");
             expect(failedLog[6]).to.contain("Internal Server Error");
-            const summary = infoCalls(logger).find((a) => a[1] === "hisDelete");
+            const summary = summaryCalls(logger).find((a) => a[1] === "hisDelete");
             expect(summary[4]).to.equal(1);
             expect(summary[6]).to.equal("rows");
         });
@@ -375,7 +376,7 @@ describe("client batch operations: progress and request logging", () => {
             expect(recordingProgress.bars).to.eql([]);
         });
 
-        it("logs planning at info, each group at debug and each count query and delete at trace", async () => {
+        it("logs planning at info, each group, the start and summary at debug, and each count query and delete at trace", async () => {
             const rows = every("2026-09-01T00:00:00Z", 3 * 1440, MIN);
             const { ws, fake, logger } = hisDeleteClient({
                 [CHILLER.chwSupplyTemp]: { rows },
@@ -386,10 +387,13 @@ describe("client batch operations: progress and request logging", () => {
 
             const sent = deletes(fake).length;
             const counts = fake.requests.filter((r) => r.uri === "/graphql").length;
-            const info = logger.info.args.map((a) => a[0]);
-            expect(info).to.include.members([
+            // Only planning's start and end are info: they are rare, and planning can be long.
+            const info = logger.info.args.map((a) => a[0]).filter((m) => /^batch\./.test(m));
+            expect(info).to.eql([
                 "batch.hisDelete: planning %d points in %d groups over %s",
                 "batch.hisDelete: planned %d requests, %d rows from %d count queries in %d ms",
+            ]);
+            expect(logger.debug.args.map((a) => a[0])).to.include.members([
                 "batch.%s: sending %d requests, %d %s (batch size %d, parallel %d, delay %d ms, retries %d)",
                 SUMMARY,
             ]);
@@ -419,14 +423,16 @@ describe("client batch operations: progress and request logging", () => {
     });
 
     describe("request logging levels", () => {
-        it("logs the start of an operation at info and each request sent at trace", async () => {
+        it("logs the start of an operation at debug, nothing at info, and each request sent at trace", async () => {
             const { ws, logger, sent } = hisWriteClient();
 
             await ws.batch.hisWrite(chillerSamples([CHILLER.chwSupplyTemp], 25), {
                 batchSize: 10, parallel: 2, batchDelay: 0, retries: 1, retryDelay: 0
             });
 
-            const start = logger.info.args.find((a) => a[0].startsWith("batch.%s: sending"));
+            // A history write runs on every trigger at the edge, so it adds nothing at info.
+            expect(logger.info.args.filter((a) => /^batch\./.test(a[0]))).to.eql([]);
+            const start = logger.debug.args.find((a) => a[0].startsWith("batch.%s: sending"));
             expect(start.slice(1)).to.eql(["hisWrite", 3, 25, "items", 10, 2, 0, 1]);
             const traces = logger.trace.args.filter((a) => a[0] === "batch.%s: sending request %d/%d, %d %s");
             expect(traces.map((a) => [a[2], a[3], a[4]])).to.eql([[1, 3, 10], [2, 3, 10], [3, 3, 5]]);

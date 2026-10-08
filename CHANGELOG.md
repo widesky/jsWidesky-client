@@ -10,7 +10,7 @@ This project adheres to [Semantic Versioning](http://semver.org/).
   - Each request is logged at debug level with its duration, retries and size, and each operation ends with an info summary.
   - `client.features.batchProgress` reports that the client supports this.
   - `batch.hisDelete` also reports planning progress per group of points, before any delete is sent.
-  - Batch operations log at trace (each request sent, each count query), debug (each request, retry and planned group) and info (start and end of each operation and of planning).
+  - Batch operations log at trace (each request sent, each count query), debug (start, summary, each request, retry and planned group) and info (start and end of delete planning only).
 - [CORE-9209](https://widesky.atlassian.net/browse/CORE-9209): `batch.hisDelete` options `maxBisectDepth`, `countBucketUnits`, `retries` and `retryDelay`, and `client.features.hisDeletePlanner` for feature detection.
 - [CORE-9209](https://widesky.atlassian.net/browse/CORE-9209): `retries` and `retryDelay` options for every batch operation, retrying requests that fail with a 500/502/503/504 or network error.
 

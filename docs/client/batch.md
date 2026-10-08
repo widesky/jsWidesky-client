@@ -443,11 +443,11 @@ await client.batch.hisDelete(ids, "s:2026-09-01,2026-09-04", { progress });
 
 | Level   | What is logged                                                                                              |
 |---------|-------------------------------------------------------------------------------------------------------------|
-| `info`  | The start of each operation (requests, items, batch size, parallel, delay, retries) and its summary (requests done, how many failed, items sent, total time). `batch.hisDelete` also logs the start and end of planning (points, groups, requests and rows planned, count queries, time). |
-| `debug` | Each completed request (number, duration, retries and size, or its error), each retry with the failure being retried, and, for `batch.hisDelete`, each planned group (points, requests, rows, count queries, time) and the options in use. An operation with nothing to send is logged here. |
+| `info`  | `batch.hisDelete` only: the start and end of planning (points, groups, requests and rows planned, count queries, time). Planning is rare and can be long, so it is worth seeing at the default level. |
+| `debug` | The start of each operation (requests, items, batch size, parallel, delay, retries) and its summary (requests done, how many failed, items sent, total time); each completed request (number, duration, retries and size, or its error); each retry with the failure being retried; and, for `batch.hisDelete`, each planned group (points, requests, rows, count queries, time) and the options in use. An operation with nothing to send is logged here. The start and summary are not at `info` because batch operations can run constantly (an edge engine runs one per history write), and a client logs at `info` by default. |
 | `trace` | Each request as it is sent, and, for `batch.hisDelete`, each count query (unit, window, points, buckets and rows found) and each delete (range, points, rows planned). |
 
-For example, at `debug`:
+For example, at `debug` (only the two `planning`/`planned` lines appear at `info`):
 
 ```
 batch.hisDelete: planning 30 points in 3 groups over s:2026-09-01,2026-09-04
