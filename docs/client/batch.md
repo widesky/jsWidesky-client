@@ -408,10 +408,18 @@ carries:
 | `durationMs` | Time the request took, retries included.                                    |
 | `failed`     | Requests failed so far.                                                     |
 
-`batch.hisDelete` (and `batch.hisDeleteByFilter`) count the planned delete requests and create the counter with the
-payload `{ rowsTotal }`, the rows the plan will delete. A request the server halves for its record limit still counts
-as one request. Nothing is reported while the deletes are being planned, or when no request is planned (every group
-was not sent or failed to plan). A point with no rows in the range still gets a planned request.
+`batch.hisDelete` (and `batch.hisDeleteByFilter`) report two counters on the same reporter, one after the other:
+
+- **Planning**, while the row counts are queried: one step per group of points (`batchSizeEntity` points), created
+  with the payload `{ phase: "planning", points }`. Each step's payload adds `requestsPlanned`, `rowsPlanned` and
+  `countQueries` so far. Planning a large delete can take many count queries, so this shows it is moving.
+- **Deleting**: one step per planned delete request, created with the payload `{ phase: "deleting", rowsTotal }`,
+  `rowsTotal` being the rows the plan will delete. A request the server halves for its record limit still counts as
+  one request.
+
+The planning counter is removed before the deleting counter is created. No deleting counter is created when no
+request is planned (every group was not sent or failed to plan); a point with no rows in the range still gets a
+planned request.
 
 `RequestProgress`, exported by the package, is a reporter that writes one plain line per change, through a writer
 that also receives the counter, so a caller can log the line or build its own display from the counter's `value`,
@@ -431,12 +439,23 @@ await client.batch.hisDelete(ids, "s:2026-09-01,2026-09-04", { progress });
 // [hisDelete #1] 100% | 12/12 | done 13557 of 13557 rows
 ```
 
-**Logging.** Each completed request is logged at `debug` level, with its number, duration, retries and size, or its
-error. Each operation ends with one `info` line: the requests done, how many failed, the items (rows for
-`batch.hisDelete`) sent and the total time. For example:
+**Logging.** Batch operations log on the client's logger at three levels:
+
+| Level   | What is logged                                                                                              |
+|---------|-------------------------------------------------------------------------------------------------------------|
+| `info`  | The start of each operation (requests, items, batch size, parallel, delay, retries) and its summary (requests done, how many failed, items sent, total time). `batch.hisDelete` also logs the start and end of planning (points, groups, requests and rows planned, count queries, time). |
+| `debug` | Each completed request (number, duration, retries and size, or its error), each retry with the failure being retried, and, for `batch.hisDelete`, each planned group (points, requests, rows, count queries, time) and the options in use. An operation with nothing to send is logged here. |
+| `trace` | Each request as it is sent, and, for `batch.hisDelete`, each count query (unit, window, points, buckets and rows found) and each delete (range, points, rows planned). |
+
+For example, at `debug`:
 
 ```
-batch.hisDelete: request 3/12 ok in 184 ms, 0 retries, 1131 rows
-batch.hisDelete: request 4/12 failed in 2210 ms, 1 retry: Internal Server Error
-batch.hisDelete: 12/12 requests done (1 failed), 13557 rows in 4120 ms
+batch.hisDelete: planning 30 points in 3 groups over s:2026-09-01,2026-09-04
+batch.hisDelete: planned group 1/3 (10 points): 41 requests, 4519 rows from 78 count queries in 812 ms
+...
+batch.hisDelete: planned 120 requests, 13557 rows from 233 count queries in 2410 ms
+batch.hisDelete: sending 120 requests, 13557 rows (batch size 1, parallel 1, delay 0 ms, retries 0)
+batch.hisDelete: request 3/120 ok in 184 ms, 0 retries, 113 rows
+batch.hisDelete: delete over s:2026-09-01T06:00:00Z,2026-09-01T07:00:00Z failed, retry 1: Service Unavailable
+batch.hisDelete: 120/120 requests done (0 failed), 13557 rows in 21400 ms
 ```

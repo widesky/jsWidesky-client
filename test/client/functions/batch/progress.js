@@ -78,7 +78,10 @@ function recordedProgress(label) {
 }
 
 const debugLines = (logger) => logger.debug.args.map((a) => a[0]);
-const infoCalls = (logger) => logger.info.args.filter((a) => /^batch\./.test(a[0]));
+const SUMMARY = "batch.%s: %d/%d requests done (%d failed), %d %s in %d ms";
+const infoCalls = (logger) => logger.info.args.filter((a) => a[0] === SUMMARY);
+// The delete counter's lines; batch.hisDelete reports planning on a counter before it.
+const deleting = (lines) => lines.filter((l) => l.payload.phase === "deleting");
 
 describe("client batch operations: progress and request logging", () => {
     describe("batch.hisWrite", () => {
@@ -280,12 +283,17 @@ describe("client batch operations: progress and request logging", () => {
             const { progress, lines } = recordedProgress("hisDelete");
 
             const res = await ws.batch.hisDelete([CHILLER.chwSupplyTemp, CHILLER.chwReturnTemp], RANGE, { progress });
+            const planningLines = lines.filter((l) => l.payload.phase === "planning");
+            lines.splice(0, lines.length, ...deleting(lines));
 
             expect(res.errors).to.eql([]);
             const sent = deletes(fake).length;
             const rows = 3 * 1440 + (3 * 1440) / 5;
             expect(lines[0]).to.include({ value: 0, total: sent });
-            expect(lines[0].payload).to.eql({ rowsTotal: rows });
+            expect(lines[0].payload).to.eql({ phase: "deleting", rowsTotal: rows });
+            // Planning was reported first, on its own counter: one group of two points.
+            expect(planningLines.map((l) => [l.value, l.total])).to.eql([[0, 1], [1, 1]]);
+            expect(planningLines.at(-1).payload).to.include({ requestsPlanned: sent, rowsPlanned: rows });
             const last = lines[lines.length - 1];
             expect(last).to.include({ value: sent, total: sent });
             expect(last.payload).to.include({ rowsTotal: rows, sizeDone: rows, failed: 0 });
@@ -300,6 +308,7 @@ describe("client batch operations: progress and request logging", () => {
             const { progress, lines } = recordedProgress("hisDelete");
 
             const res = await ws.batch.hisDelete([CHILLER.chwSupplyTemp], RANGE, { batchSize: 500, progress });
+            lines.splice(0, lines.length, ...deleting(lines));
 
             expect(res.errors).to.eql([]);
             const planned = lines[0].total;
@@ -316,6 +325,7 @@ describe("client batch operations: progress and request logging", () => {
             const { progress, lines } = recordedProgress("hisDelete");
 
             const res = await ws.batch.hisDelete([CHILLER.chwSupplyTemp], RANGE, { progress });
+            lines.splice(0, lines.length, ...deleting(lines));
 
             expect(res.errors).to.have.length(1);
             const outcomes = lines.slice(1).map((l) => l.payload.ok);
@@ -327,6 +337,126 @@ describe("client batch operations: progress and request logging", () => {
             const summary = infoCalls(logger).find((a) => a[1] === "hisDelete");
             expect(summary[4]).to.equal(1);
             expect(summary[6]).to.equal("rows");
+        });
+
+        it("reports planning progress per group before any delete is sent", async () => {
+            const rows = every("2026-09-01T00:00:00Z", 3 * 1440, MIN);
+            const { ws, fake } = hisDeleteClient({
+                [CHILLER.chwSupplyTemp]: { rows },
+                [CHILLER.chwReturnTemp]: { rows },
+                [CHILLER.condenserFlow]: { rows },
+            });
+            const order = [];
+            const { progress, lines } = recordedProgress("hisDelete");
+            const sentBefore = [];
+            const recordingProgress = new RequestProgress({
+                label: "hisDelete",
+                write: (line, bar) => {
+                    sentBefore.push(deletes(fake).length);
+                    order.push(bar.payload.phase);
+                    progress.write(line, bar);
+                }
+            });
+
+            const res = await ws.batch.hisDelete(Object.values(CHILLER), RANGE,
+                { batchSizeEntity: 1, progress: recordingProgress });
+
+            expect(res.errors).to.eql([]);
+            const planning = lines.filter((l) => l.payload.phase === "planning");
+            // One group per point: 0/3 when created, then one step per planned group.
+            expect(planning.map((l) => [l.value, l.total])).to.eql([[0, 3], [1, 3], [2, 3], [3, 3]]);
+            expect(planning.map((l) => l.payload.rowsPlanned || 0)).to.eql([0, 4320, 8640, 12960]);
+            const counts = fake.requests.filter((r) => r.uri === "/graphql").length;
+            expect(planning.at(-1).payload.countQueries).to.equal(counts);
+            // Planning finishes, and its counter is released, before the first delete goes out.
+            const firstDelete = order.indexOf("deleting");
+            expect(order.slice(0, firstDelete).every((phase) => phase === "planning")).to.equal(true);
+            expect(sentBefore.slice(0, firstDelete).every((n) => n === 0)).to.equal(true);
+            expect(recordingProgress.bars).to.eql([]);
+        });
+
+        it("logs planning at info, each group at debug and each count query and delete at trace", async () => {
+            const rows = every("2026-09-01T00:00:00Z", 3 * 1440, MIN);
+            const { ws, fake, logger } = hisDeleteClient({
+                [CHILLER.chwSupplyTemp]: { rows },
+                [CHILLER.chwReturnTemp]: { rows },
+            });
+
+            await ws.batch.hisDelete([CHILLER.chwSupplyTemp, CHILLER.chwReturnTemp], RANGE, { batchSizeEntity: 1 });
+
+            const sent = deletes(fake).length;
+            const counts = fake.requests.filter((r) => r.uri === "/graphql").length;
+            const info = logger.info.args.map((a) => a[0]);
+            expect(info).to.include.members([
+                "batch.hisDelete: planning %d points in %d groups over %s",
+                "batch.hisDelete: planned %d requests, %d rows from %d count queries in %d ms",
+                "batch.%s: sending %d requests, %d %s (batch size %d, parallel %d, delay %d ms, retries %d)",
+                SUMMARY,
+            ]);
+            const planned = logger.info.args.find((a) => a[0].startsWith("batch.hisDelete: planned"));
+            expect(planned.slice(1, 4)).to.eql([sent, 2 * 3 * 1440, counts]);
+            const groupLines = logger.debug.args.filter((a) => a[0].startsWith("batch.hisDelete: planned group"));
+            expect(groupLines.map((a) => [a[1], a[2], a[3]])).to.eql([[1, 2, 1], [2, 2, 1]]);
+            const traces = logger.trace.args.map((a) => a[0]);
+            expect(traces.filter((t) => t.startsWith("batch.hisDelete: count by"))).to.have.length(counts);
+            expect(traces.filter((t) => t.startsWith("batch.hisDelete: deleting"))).to.have.length(sent);
+        });
+
+        it("logs each retry of a delete at debug", async () => {
+            const { ws, fake, logger } = hisDeleteClient({
+                [CHILLER.chwSupplyTemp]: { rows: every("2026-09-01T00:00:00Z", 1440, MIN) },
+            });
+            fake.failNext((r) => r.uri === "/api/hisDelete", () => haystackError(503, "Service Unavailable"));
+
+            const res = await ws.batch.hisDelete([CHILLER.chwSupplyTemp], RANGE, { retries: 1, retryDelay: 0 });
+
+            expect(res.errors).to.eql([]);
+            const retries = logger.debug.args.filter((a) => a[0] === "batch.hisDelete: delete over %s failed, retry %d: %s");
+            expect(retries).to.have.length(1);
+            expect(retries[0][2]).to.equal(1);
+            expect(retries[0][3]).to.contain("Service Unavailable");
+        });
+    });
+
+    describe("request logging levels", () => {
+        it("logs the start of an operation at info and each request sent at trace", async () => {
+            const { ws, logger, sent } = hisWriteClient();
+
+            await ws.batch.hisWrite(chillerSamples([CHILLER.chwSupplyTemp], 25), {
+                batchSize: 10, parallel: 2, batchDelay: 0, retries: 1, retryDelay: 0
+            });
+
+            const start = logger.info.args.find((a) => a[0].startsWith("batch.%s: sending"));
+            expect(start.slice(1)).to.eql(["hisWrite", 3, 25, "items", 10, 2, 0, 1]);
+            const traces = logger.trace.args.filter((a) => a[0] === "batch.%s: sending request %d/%d, %d %s");
+            expect(traces.map((a) => [a[2], a[3], a[4]])).to.eql([[1, 3, 10], [2, 3, 10], [3, 3, 5]]);
+            expect(sent).to.have.length(3);
+        });
+
+        it("logs each retry of a request at debug, with the failure", async () => {
+            const { ws, logger, failNext } = hisWriteClient();
+            failNext((n) => n === 1, haystackError(502, "Bad Gateway"));
+
+            await ws.batch.hisWrite(chillerSamples([CHILLER.chwSupplyTemp], 10), {
+                batchSize: 10, retries: 2, retryDelay: 0
+            });
+
+            const retries = logger.debug.args.filter((a) => a[0] === "batch.%s: request %d/%d failed, retry %d: %s");
+            expect(retries.map((a) => a.slice(1, 5))).to.eql([["hisWrite", 1, 1, 1]]);
+            expect(retries[0][5]).to.contain("Bad Gateway");
+        });
+
+        it("logs at debug, not info, when there is nothing to send", async () => {
+            const { ws, logger, sent } = hisWriteClient();
+            ws.test = () => {
+                throw new Error("must not be called");
+            };
+
+            await ws.performOpInBatch("test", [[]]);
+
+            expect(sent).to.eql([]);
+            expect(logger.debug.args.map((a) => a[0])).to.include("batch.%s: nothing to send");
+            expect(logger.info.args.filter((a) => /^batch\./.test(a[0]))).to.eql([]);
         });
     });
 });
