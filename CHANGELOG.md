@@ -4,6 +4,10 @@ This project adheres to [Semantic Versioning](http://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- [CORE-9673](https://widesky.atlassian.net/browse/CORE-9673): Access tokens, the OAuth client
+  secret and user passwords no longer appear in debug or trace logs.
+
 ## [3.5.0] - 2026-08-13
 
 ### Added
