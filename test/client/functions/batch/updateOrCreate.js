@@ -9,6 +9,8 @@ const DEFAULT_OPTIONS = {
     "batchSize": 2000,
     "parallel": 1,
     "parallelDelay": 0,
+    "retries": 0,
+    "retryDelay": 2000,
     "returnResult": true
 };
 

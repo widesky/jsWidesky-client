@@ -4,6 +4,22 @@ This project adheres to [Semantic Versioning](http://semver.org/).
 
 ## [Unreleased]
 
+### Added
+- [CORE-9209](https://widesky.atlassian.net/browse/CORE-9209): `batch.hisDelete` options `maxBisectDepth`, `countBucketUnits`, `retries` and `retryDelay`, and `client.features.hisDeletePlanner` for feature detection.
+- [CORE-9209](https://widesky.atlassian.net/browse/CORE-9209): `retries` and `retryDelay` options for every batch operation, retrying requests that fail with a 500/502/503/504 or network error.
+
+### Changed
+- [CORE-9209](https://widesky.atlassian.net/browse/CORE-9209): `batch.hisDelete` sizes deletes from server-side record counts instead of reading every row first, and accepts a Haystack range string as well as two Dates.
+  - A request now holds at most 500 rows in total across at most 10 points (was 1500 rows per point / 100 points).
+  - Requests rejected for the per-point record limit are halved and retried, up to `maxBisectDepth` times.
+  - A range split into several requests keeps one form the server accepts; a date range is split in each point's timezone.
+  - `today`, `yesterday` and a single date are split like a date range, in each point's timezone.
+  - Ranges it cannot split within the row limit (mixed forms, no seconds, points without a timezone) are reported and not deleted.
+  - `batch.hisDeleteByFilter` uses the same planner, new defaults (500 / 10) and the new options.
+
+### Fixed
+- [CORE-9209](https://widesky.atlassian.net/browse/CORE-9209): `batch.hisRead` and `hisRead` return each point's history on that point when a request fails, the points span several requests, or a request holds one point.
+
 ## [3.5.0] - 2026-08-13
 
 ### Added
