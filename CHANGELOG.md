@@ -5,10 +5,19 @@ This project adheres to [Semantic Versioning](http://semver.org/).
 ## [Unreleased]
 
 ### Added
+- [CORE-9592](https://widesky.atlassian.net/browse/CORE-9592): Batch operations report progress per request and log each request's outcome.
+  - A `progress` reporter can be given per call; `RequestProgress` is a ready-made line-based reporter.
+  - Each request is logged at debug level with its duration, retries and size, and each operation ends with an info summary.
+  - `client.features.batchProgress` reports that the client supports this.
+  - `batch.hisDelete` also reports planning progress per group of points, before any delete is sent.
+  - Batch operations log at trace (each request sent, each count query), debug (start, summary, each request, retry and planned group) and info (start and end of delete planning only).
 - [CORE-9209](https://widesky.atlassian.net/browse/CORE-9209): `batch.hisDelete` options `maxBisectDepth`, `countBucketUnits`, `retries` and `retryDelay`, and `client.features.hisDeletePlanner` for feature detection.
 - [CORE-9209](https://widesky.atlassian.net/browse/CORE-9209): `retries` and `retryDelay` options for every batch operation, retrying requests that fail with a 500/502/503/504 or network error.
 
 ### Changed
+- [CORE-9592](https://widesky.atlassian.net/browse/CORE-9592): Client-wide `progress` counters now count requests, advance as each request completes and are removed when the operation ends.
+  - With cli-progress, a finished bar is cleared from the terminal.
+  - A fractional `batchSize` or `batchSizeEntity` is rounded down to a whole number of items or entities per request.
 - [CORE-9209](https://widesky.atlassian.net/browse/CORE-9209): `batch.hisDelete` sizes deletes from server-side record counts instead of reading every row first, and accepts a Haystack range string as well as two Dates.
   - A request now holds at most 500 rows in total across at most 10 points (was 1500 rows per point / 100 points).
   - Requests rejected for the per-point record limit are halved and retried, up to `maxBisectDepth` times.

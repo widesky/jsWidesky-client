@@ -42,6 +42,12 @@ The Object defined in `client.progress` is expected to have the following struct
 | `create`                    | A string that defines a create function on `client.progress.instance`.     | String  | "create"                                                                                                                           |
 | `update`                    | A string that defines a update function on `client.progress.instance`.     | String  | "update"                                                                                                                           |
 
+Batch operations count requests: each creates one counter whose total is its number of requests, increments it as each
+request completes (with `increment`, or `update` for a counter that has no `increment`), then stops it and calls
+`remove` on `client.progress.instance` when it has one; with cli-progress, `remove` also clears the finished bar from
+the terminal. A `progress` reporter given in the options of a batch call is used instead of this one; see
+[Progress and logging](batch.md#progress-and-logging).
+
 ### Path `client.performOpInBatch`
 The Object defined in `client.performOpInBatch` is expected to have the following structure:
 

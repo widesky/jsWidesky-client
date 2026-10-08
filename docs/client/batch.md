@@ -17,6 +17,7 @@
   - [Path `client.batch.updateOrCreate`](#path-clientbatchupdateorcreate)
   - [Path `client.batch.multiFind`](#path-clientbatchmultifind)
   - [Retries](#retries)
+  - [Progress and logging](#progress-and-logging)
 
 <!-- tocstop -->
 
@@ -40,7 +41,8 @@ The `batch` property of the `options` argument used in `WideSkyClient` is expect
 | `updateOrCreate`         | Define the default batch configurations for this functions. | Object |   As per the table of configurations for `client.batch.updateOrCreate`    |
 
 Every batch operation accepts `retries` and `retryDelay`, in its client configuration or in the options of the call.
-See [Retries](#retries).
+See [Retries](#retries). Every batch operation also accepts a `progress` reporter in the options of the call; see
+[Progress and logging](#progress-and-logging).
 
 ### Path `client.batch.hisRead`
 The Object in `client.batch.hisRead` is expected to have the following structure:
@@ -380,3 +382,80 @@ defaults. `performOpInBatch` called directly also takes them, defaulting to `cli
 `client.batch.<operation>`.
 `batch.hisDelete` and `batch.hisDeleteByFilter` retry their own count queries, timezone reads and deletes (see
 [Failures and retries](#failures-and-retries)).
+
+### Progress and logging
+Each batch operation counts the requests it sends and reports each one as it completes.
+Clients with this behaviour have `client.features.batchProgress === true`.
+
+**Progress.** Pass a progress reporter as the `progress` option of the call, or configure one client-wide with
+[`client.progress`](options.md#path-clientprogress); the call's reporter wins. A reporter implements the subset of the
+cli-progress `MultiBar` interface the client uses: `create(total, value, payload)` returning a counter with
+`increment(delta, payload)` (or `update(value, payload)`) and `stop()`, and optionally `remove(counter)`. A reporter
+that throws is logged at `warn` level once and not called again for that operation; it never changes the operation's
+result. For each operation the client creates one
+counter whose total is the number of requests, increments it by 1 as each request completes (not once per parallel
+group), then stops and removes it, so one reporter can be reused for any number of calls. Each increment's payload
+carries:
+
+| Payload key  | Description                                                                 |
+|--------------|-----------------------------------------------------------------------------|
+| `ok`         | Whether the request succeeded.                                              |
+| `error`      | The error message of a failed request.                                      |
+| `size`       | Items in the request; for `batch.hisDelete`, the rows it was planned to hold. |
+| `sizeDone`   | Items (rows for `batch.hisDelete`) in the requests completed so far, failed ones included. |
+| `sizeOk`     | Items (rows for `batch.hisDelete`) in the requests that succeeded so far.   |
+| `retries`    | Extra attempts the request needed.                                          |
+| `durationMs` | Time the request took, retries included.                                    |
+| `failed`     | Requests failed so far.                                                     |
+
+`batch.hisDelete` (and `batch.hisDeleteByFilter`) report two counters on the same reporter, one after the other:
+
+- **Planning**, while the row counts are queried: one step per group of points (`batchSizeEntity` points), created
+  with the payload `{ phase: "planning", points }`. Each step's payload adds `requestsPlanned`, `rowsPlanned` and
+  `countQueries` so far. Planning a large delete can take many count queries, so this shows it is moving.
+- **Deleting**: one step per planned delete request, created with the payload `{ phase: "deleting", rowsTotal }`,
+  `rowsTotal` being the rows the plan will delete. A request the server halves for its record limit still counts as
+  one request.
+
+The planning counter is removed before the deleting counter is created. No deleting counter is created when no
+request is planned (every group was not sent or failed to plan); a point with no rows in the range still gets a
+planned request.
+
+`RequestProgress`, exported by the package, is a reporter that writes one plain line per change, through a writer
+that also receives the counter, so a caller can log the line or build its own display from the counter's `value`,
+`getTotal()` and `payload`:
+
+```javascript
+const { RequestProgress } = require("@widesky/jswidesky-client");
+
+const progress = new RequestProgress({
+    label: "hisDelete",
+    write: (line, counter) => console.log(line, counter.payload.sizeOk || 0, "of", counter.payload.rowsTotal, "rows")
+});
+await client.batch.hisDelete(ids, "s:2026-09-01,2026-09-04", { progress });
+// [hisDelete #1] 0% | 0/12 0 of 13557 rows
+// [hisDelete #1] 8% | 1/12 1131 of 13557 rows
+// ...
+// [hisDelete #1] 100% | 12/12 | done 13557 of 13557 rows
+```
+
+**Logging.** Batch operations log on the client's logger at three levels:
+
+| Level   | What is logged                                                                                              |
+|---------|-------------------------------------------------------------------------------------------------------------|
+| `info`  | `batch.hisDelete` only: the start and end of planning (points, groups, requests and rows planned, count queries, time). Planning is rare and can be long, so it is worth seeing at the default level. |
+| `debug` | The start of each operation (requests, items, batch size, parallel, delay, retries) and its summary (requests done, how many failed, items sent, total time); each completed request (number, duration, retries and size, or its error); each retry with the failure being retried; and, for `batch.hisDelete`, each planned group (points, requests, rows, count queries, time) and the options in use. An operation with nothing to send is logged here. The start and summary are not at `info` because batch operations can run constantly (an edge engine runs one per history write), and a client logs at `info` by default. |
+| `trace` | Each request as it is sent, and, for `batch.hisDelete`, each count query (unit, window, points, buckets and rows found) and each delete (range, points, rows planned). |
+
+For example, at `debug` (only the two `planning`/`planned` lines appear at `info`):
+
+```
+batch.hisDelete: planning 30 points in 3 groups over s:2026-09-01,2026-09-04
+batch.hisDelete: planned group 1/3 (10 points): 41 requests, 4519 rows from 78 count queries in 812 ms
+...
+batch.hisDelete: planned 120 requests, 13557 rows from 233 count queries in 2410 ms
+batch.hisDelete: sending 120 requests, 13557 rows (batch size 1, parallel 1, delay 0 ms, retries 0)
+batch.hisDelete: request 3/120 ok in 184 ms, 0 retries, 113 rows
+batch.hisDelete: delete over s:2026-09-01T06:00:00Z,2026-09-01T07:00:00Z failed, retry 1: Service Unavailable
+batch.hisDelete: 120/120 requests done (0 failed), 13557 rows in 21400 ms
+```

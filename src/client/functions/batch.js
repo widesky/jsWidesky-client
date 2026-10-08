@@ -72,11 +72,14 @@ function isRowsSorted(rows) {
  * @param batchSize Maximum size of each batch. For Objects, it's the number of key-value pairs found in the Object
  *                  of each attribute specified in the Object. For Arrays, its number of elements.
  * @param transformer A transformer for the batched arguments.
- * @returns {{p1, hasMore: (function(): boolean), getNext}}
+ * @returns {{count: number, items: number, hasMore: (function(): boolean), getNext}} count is the
+ *     number of requests the payload makes, items the size of the payload.
  */
 function createBatchIterator(op, payload, clientArgs, batchSize, transformer, batchSizeEntity) {
-    let hasMore, getNext, p1;
+    let hasMore, getNext, count, items;
     if (Array.isArray(payload)) {
+        count = Math.ceil(payload.length / batchSize);
+        items = payload.length;
         getNext = () => {
             const next = payload.splice(0, batchSize);
             if (op === "hisDelete") {
@@ -93,10 +96,6 @@ function createBatchIterator(op, payload, clientArgs, batchSize, transformer, ba
             }
         };
         hasMore = () => payload.length > 0;
-
-        if (this.isProgressEnabled) {
-            p1 = this.progressCreate(payload.length);
-        }
     } else if (typeof payload === "object") {
         // check if structure is as expected
         for (const [key, valueAsObject] of Object.entries(payload)) {
@@ -110,6 +109,8 @@ function createBatchIterator(op, payload, clientArgs, batchSize, transformer, ba
         const keyValueLength = payloadKeys.map((key) => Object.keys(payload[key]).length);
         const keyValueRemaining = [...keyValueLength];
         let currKeyIndex = 0;
+        count = countObjectRequests(keyValueLength, batchSize, entityCap);
+        items = keyValueLength.reduce((n, length) => n + length, 0);
         getNext = () => {
             // get next set using batchSize as maximum number of rows, not inclusive of the key,
             // and batchSizeEntity as maximum number of distinct top-level keys in the batch.
@@ -169,15 +170,215 @@ function createBatchIterator(op, payload, clientArgs, batchSize, transformer, ba
             }
             return currKeyIndex !== payloadKeys.length && keyValueLength[currKeyIndex] !== 0
         };
-
-        if (this.isProgressEnabled) {
-            p1 = this.progressCreate(Object.keys(payload).length);
-        }
     } else {
         throw new Error("First element of parameter should be of type Array or Object");
     }
 
-    return { hasMore, getNext, p1 };
+    return { hasMore, getNext, count, items };
+}
+
+/**
+ * The number of requests an Object payload makes, worked out from its row counts alone so that
+ * nothing is copied: the same packing as createBatchIterator's getNext.
+ * @param {number[]} lengths Rows under each top-level key, in key order.
+ * @param {number} batchSize Most rows in one request.
+ * @param {number} entityCap Most top-level keys in one request.
+ * @returns {number} The number of requests.
+ */
+function countObjectRequests(lengths, batchSize, entityCap) {
+    const remaining = [...lengths];
+    let index = 0;
+    let requests = 0;
+    const skipEmpty = () => {
+        while (index < remaining.length && remaining[index] === 0) index++;
+    };
+    skipEmpty();
+    while (index < remaining.length) {
+        let rows = 0;
+        let entities = 0;
+        while (rows < batchSize && entities < entityCap && index < remaining.length) {
+            if (remaining[index] === 0) {
+                index++;
+                continue;
+            }
+            const taken = Math.min(remaining[index], batchSize - rows);
+            remaining[index] -= taken;
+            rows += taken;
+            entities++;
+            if (remaining[index] === 0) index++;
+        }
+        requests++;
+        skipEmpty();
+    }
+    return requests;
+}
+
+/**
+ * One progress counter on the call's reporter (or the client-wide one), with the reporter's
+ * failures contained: a reporter is the caller's code, so a failure in it is logged once and
+ * never changes the result of the batch operation.
+ * @param {string} label Operation name used in the log lines, e.g. "hisWrite".
+ * @param {number} total The counter's total.
+ * @param {Object} [progress] Per-call progress reporter (cli-progress MultiBar interface, e.g.
+ *     RequestProgress); the client-wide `progress` configuration is used when absent.
+ * @param {Object} [payload] Details given to the counter when it is created.
+ * @returns {{advance: function(number, Object): void, release: function(): void}}
+ */
+function createProgressCounter(label, total, progress, payload) {
+    const logger = this.logger;
+    let reporter = null;
+    if (progress && typeof progress.create === "function") {
+        reporter = { instance: progress, create: "create", increment: "increment", update: "update" };
+    } else if (this.isProgressEnabled) {
+        const { instance, create, increment, update } = this.clientOptions.progress;
+        reporter = { instance, create, increment, update };
+    }
+    let reporterFailed = false;
+    const report = (what, fn) => {
+        if (reporterFailed) return undefined;
+        try {
+            return fn();
+        } catch (error) {
+            reporterFailed = true;
+            if (logger) {
+                logger.warn("batch.%s: progress reporter failed on %s, not reporting further: %s",
+                    label, what, error.message);
+            }
+            return undefined;
+        }
+    };
+    const bar = reporter ? report("create", () => reporter.instance[reporter.create](total, 0, { ...payload })) : null;
+
+    return {
+        /**
+         * Advance the counter to `done`.
+         * @param {number} done Steps completed so far.
+         * @param {Object} details Payload for this step.
+         */
+        advance(done, details) {
+            if (!bar) return;
+            report("increment", () => {
+                // Counters that only implement update (the earlier client-wide contract).
+                if (typeof bar[reporter.increment] === "function") {
+                    bar[reporter.increment](1, details);
+                } else {
+                    bar[reporter.update](done, details);
+                }
+            });
+        },
+        /**
+         * Stop the counter and remove it from its reporter.
+         */
+        release() {
+            if (!bar) return;
+            // Released even after the reporter failed, so a reused reporter keeps no counter.
+            try {
+                report("stop", () => {
+                    if (typeof bar.stop === "function") bar.stop();
+                });
+            } finally {
+                try {
+                    if (typeof reporter.instance.remove === "function") reporter.instance.remove(bar);
+                } catch (error) {
+                    if (logger) {
+                        logger.warn("batch.%s: progress reporter failed to remove its counter: %s",
+                            label, error.message);
+                    }
+                }
+            }
+        }
+    };
+}
+
+/**
+ * Track the requests of one batch operation: log each as it is sent (trace), retried (debug) and
+ * completed (debug), advance the progress counter, and log a summary when the operation ends
+ * (debug).
+ * @param {string} label Operation name used in the log lines, e.g. "hisWrite".
+ * @param {number} total Requests the operation makes.
+ * @param {Object} [progress] Per-call progress reporter; see createProgressCounter.
+ * @param {Object} [payload] Details given to the counter when it is created.
+ * @param {string} unit What a request's size counts, for the log lines.
+ * @returns {{sent: function(number, number): void, retried: function(number, number, *): void,
+ *     complete: function(Object): void, finish: function(): void}}
+ */
+function createRequestTracker(label, total, progress, payload, unit) {
+    const logger = this.logger;
+    const counter = createProgressCounter.call(this, label, total, progress, payload);
+    const started = Date.now();
+    let done = 0;
+    let failed = 0;
+    let size = 0;
+    let sizeOk = 0;
+
+    return {
+        /**
+         * Record a request being sent.
+         * @param {number} number The request's number, from 1.
+         * @param {number} requestSize Items in the request.
+         */
+        sent(number, requestSize) {
+            if (logger) {
+                logger.trace("batch.%s: sending request %d/%d, %d %s", label, number, total, requestSize, unit);
+            }
+        },
+        /**
+         * Record a retry of a request after a transient failure.
+         * @param {number} number The request's number, from 1.
+         * @param {number} attempt The retry about to be made, from 1.
+         * @param {*} error The failure being retried.
+         */
+        retried(number, attempt, error) {
+            if (logger) {
+                logger.debug("batch.%s: request %d/%d failed, retry %d: %s",
+                    label, number, total, attempt, error && error.message);
+            }
+        },
+        /**
+         * Record a completed request.
+         * @param {{ok: boolean, error?: string, size: number, retries: number, durationMs: number}} outcome
+         */
+        complete(outcome) {
+            done++;
+            size += outcome.size || 0;
+            if (outcome.ok) {
+                sizeOk += outcome.size || 0;
+            } else {
+                failed++;
+            }
+            if (logger) {
+                const retries = outcome.retries === 1 ? "1 retry" : `${outcome.retries} retries`;
+                if (outcome.ok) {
+                    logger.debug("batch.%s: request %d/%d ok in %d ms, %s, %d %s",
+                        label, done, total, outcome.durationMs, retries, outcome.size, unit);
+                } else {
+                    logger.debug("batch.%s: request %d/%d failed in %d ms, %s: %s",
+                        label, done, total, outcome.durationMs, retries, outcome.error);
+                }
+            }
+            counter.advance(done, {
+                ...payload,
+                ok: outcome.ok,
+                error: outcome.error,
+                size: outcome.size,
+                sizeDone: size,
+                sizeOk,
+                retries: outcome.retries,
+                durationMs: outcome.durationMs,
+                failed
+            });
+        },
+        /**
+         * Log the summary and release the progress counter.
+         */
+        finish() {
+            if (logger) {
+                logger.debug("batch.%s: %d/%d requests done (%d failed), %d %s in %d ms",
+                    label, done, total, failed, size, unit, Date.now() - started);
+            }
+            counter.release();
+        }
+    };
 }
 
 /**
@@ -186,15 +387,36 @@ function createBatchIterator(op, payload, clientArgs, batchSize, transformer, ba
  * @param {Array} args Arguments to be called for the client operation.
  * @param {{retries: number, retryDelay: number}} retry Extra attempts after a transient failure (see
  *     batchRetry.withRetry) and the milliseconds before each. Only the final failure is reported.
+ * @param {number} size Items in the request.
+ * @param {Object} tracker The operation's request tracker (see createRequestTracker).
+ * @param {function(*): Object} [describe] Maps a response to outcome fields that override the
+ *     defaults, for an op that records its own failures (batch.hisDelete).
+ * @param {number} number The request's number within the operation, from 1.
  * @returns {Promise<{res: *}|{error: {error: string, args: Array}}>} The response, or the error entry to report.
  *     Never rejects, so the caller can record outcomes in request order once a parallel group settles.
  */
-async function createBatchRequest(op, args, retry) {
+async function createBatchRequest(op, args, retry, size, tracker, describe, number) {
+    const started = Date.now();
+    let retries = 0;
+    const onRetry = (error) => {
+        retries++;
+        tracker.retried(number, retries, error);
+    };
+    tracker.sent(number, size);
+    let outcome;
     try {
-        return { res: await withRetry(() => this[op](...args), retry) };
+        outcome = { res: await withRetry(() => this[op](...args), { ...retry, onRetry }) };
     } catch (error) {
-        return { error: { error: error.message, args: [op, ...args] } };
+        outcome = { error: { error: error.message, args: [op, ...args] } };
     }
+    // Reported outside the request's try: only the request decides its outcome.
+    const durationMs = Date.now() - started;
+    if (outcome.error) {
+        tracker.complete({ ok: false, error: outcome.error.error, size, retries, durationMs });
+    } else {
+        tracker.complete({ ok: true, size, retries, durationMs, ...(describe ? describe(outcome.res) : {}) });
+    }
+    return outcome;
 }
 
 /**
@@ -213,6 +435,9 @@ async function createBatchRequest(op, args, retry) {
  *                           network error). 0 (default) disables retry.
  *                - retryDelay: Delay in milliseconds before each extra attempt.
  *                - transformer: A function to transform the payload to be passed to the client operation.
+ *                - progress: A progress reporter for this call (cli-progress MultiBar interface, e.g.
+ *                            RequestProgress). Its counter counts requests, advances as each completes and
+ *                            is removed when the operation ends. Defaults to the client-wide `progress`.
  * @returns {Promise<{success: Array, errors: Array<{errors: String, args: Array}>}>}
  *          - success: Contain the responses of successful operations when options.returnResult is true.
  *          - errors: Contain an errors encountered when performing operations.
@@ -232,6 +457,11 @@ async function performOpInBatch(op, args, options={}) {
     } = deriveFromDefaults(this.clientOptions.performOpInBatch, options);
 
     let { transformer } = options;
+    // label, unit, describe and progressPayload are internal: set by batch functions that wrap
+    // their own request runner (batch.hisDelete).
+    const { progress, describe, progressPayload } = options;
+    const label = options.label || op;
+    const unit = options.unit || "items";
     if (transformer == null) {
         // no transformation
         transformer = (val) => val;
@@ -243,48 +473,60 @@ async function performOpInBatch(op, args, options={}) {
     }
     const payload = args[0];
     const clientArgs = args.slice(1);
+    // Whole numbers of items and entities per request: the schema accepts fractions, which the
+    // Array and Object iterators would otherwise round differently from the request count.
+    const wholeBatchSize = Math.floor(batchSize);
+    const wholeBatchSizeEntity = batchSizeEntity == null ? batchSizeEntity : Math.floor(batchSizeEntity);
     const result = {
         errors: [],
         success: []
     };
-    const { getNext, hasMore, p1 } = createBatchIterator.call(
-        this, op, payload, clientArgs, batchSize, transformer, batchSizeEntity
+    const { getNext, hasMore, count, items } = createBatchIterator.call(
+        this, op, payload, clientArgs, wholeBatchSize, transformer, wholeBatchSizeEntity
     );
     if (!hasMore()) {
+        this.logger.debug("batch.%s: nothing to send", label);
         return result;
     }
 
-    let added = 0;
-    while (hasMore()) {
-        let sizeTotal = 0;
-        const requests = [];
+    // A wrapping batch function (batch.hisDelete) counts its own rows: its payload is requests.
+    const itemTotal = unit === "items" ? items : (progressPayload && progressPayload.rowsTotal) || 0;
+    // Start and summary are debug, not info: batch operations run all day on edge engines (every
+    // history write), whose client logs at info by default.
+    this.logger.debug("batch.%s: sending %d requests, %d %s (batch size %d, parallel %d, delay %d ms, " +
+        "retries %d)", label, count, itemTotal, unit, wholeBatchSize, parallel, batchDelay || 0, retries || 0);
+    const tracker = createRequestTracker.call(this, label, count, progress, progressPayload, unit);
+    let sentCount = 0;
+    try {
+        while (hasMore()) {
+            const requests = [];
 
-        // queue parallel requests
-        for (let i = 0; i < parallel && hasMore(); i++) {
-            const { next, size } = getNext();
-            sizeTotal += size;
-            requests.push(createBatchRequest.call(this, op, next, { retries, retryDelay }));
-            if (batchDelay > 0) {
-                await sleep(batchDelay);
+            // queue parallel requests
+            for (let i = 0; i < parallel && hasMore(); i++) {
+                const { next, size } = getNext();
+                requests.push(createBatchRequest.call(
+                    this, op, next, { retries, retryDelay }, size, tracker, describe, ++sentCount
+                ));
+                if (batchDelay > 0) {
+                    await sleep(batchDelay);
+                }
+            }
+            // Record in request order, not completion order: a retried request finishes after its peers,
+            // and hisRead / multiFind read success by position.
+            for (const outcome of await Promise.all(requests)) {
+                if (outcome.error) {
+                    result.errors.push(outcome.error);
+                } else if (returnResult) {
+                    result.success.push(outcome.res);
+                }
+            }
+
+            if (parallelDelay > 0)  {
+                await sleep(parallelDelay);
             }
         }
-        // Record in request order, not completion order: a retried request finishes after its peers,
-        // and hisRead / multiFind read success by position.
-        for (const outcome of await Promise.all(requests)) {
-            if (outcome.error) {
-                result.errors.push(outcome.error);
-            } else if (returnResult) {
-                result.success.push(outcome.res);
-            }
-        }
-
-        if (this.isProgressEnabled) {
-            p1[this.clientOptions.progress.update](added += sizeTotal);
-        }
-
-        if (parallelDelay > 0)  {
-            await sleep(parallelDelay);
-        }
+    } finally {
+        tracker.finish();
     }
 
     return result;
@@ -556,65 +798,126 @@ async function hisDelete(ids, range, endOrOptions, maybeOptions) {
 
     // At most batchSize points per request as well: points often log on the same instants, and
     // rows sharing one millisecond cannot be split by time.
-    for (const group of chunkIds(ids, Math.min(batchSizeEntity, resolved.batchSize))) {
-        if (!parsed.plannable) {
-            notSent(group, `"${parsed.raw}" is not a range batch.hisDelete can split: use two dates, one date, ` +
-                "today, yesterday, or two datetimes with seconds and the same timezone name");
-            continue;
-        }
-        // Datetime ends carry their own timezone, so the whole group shares one window. Date-only
-        // ends resolve in each point's timezone, so the group is read once and split by tz.
-        let subGroups = [{ ids: group }];
-        if (parsed.form === "date") {
-            try {
-                subGroups = await groupByZone((groupIds) => withRetry(() => this.read(groupIds), { retries, retryDelay }), group);
-            } catch (error) {
-                errors.push({ error: error.message, args: ["countQuery", group, range] });
-                continue;
-            }
-        }
-        for (const sub of subGroups) {
-            const window = windowFor(parsed, sub, nowMs);
-            if (window.unsplittable) {
-                notSent(sub.ids, window.unsplittable);
-                continue;
-            }
-            // Planning queries retry like deletes: a caller who sets retries expects planning to
-            // ride out the same transient failures.
-            const countFn = async (fromMs, toMs, unit) => parseCountResponse(
-                await withRetry(() => this.query(buildCountQuery(sub.ids, fromMs, toMs, unit)), { retries, retryDelay }), unit);
-            let plan;
-            try {
-                plan = await planGroup(countFn, sub.ids, parsed, window, resolved);
-            } catch (error) {
-                errors.push({ error: error.message, args: ["countQuery", sub.ids, range] });
-                continue;
-            }
-            if (plan.overBudget) {
-                notSent(sub.ids, plan.overBudget);
-            } else {
-                requests.push(...plan.requests);
-            }
-        }
-    }
+    const groups = chunkIds(ids, Math.min(batchSizeEntity, resolved.batchSize));
+    // Planning can take many count queries, so it reports progress per group, on its own counter
+    // before the delete counter, and logs it: info at the start and end, debug per group, trace
+    // per count query.
+    const planningStarted = Date.now();
+    let countQueries = 0;
+    let rowsPlanned = 0;
+    this.logger.info("batch.hisDelete: planning %d points in %d groups over %s",
+        ids.length, groups.length, range);
+    const planning = createProgressCounter.call(this, "hisDelete", groups.length, options.progress,
+        { phase: "planning", points: ids.length });
+    const groupPlanned = (index, group, groupStarted, groupRequests, groupQueries) => {
+        const groupRows = groupRequests.reduce((n, req) => n + (req.rows || 0), 0);
+        rowsPlanned += groupRows;
+        this.logger.debug("batch.hisDelete: planned group %d/%d (%d points): %d requests, %d rows " +
+            "from %d count queries in %d ms", index + 1, groups.length, group.length, groupRequests.length,
+            groupRows, groupQueries, Date.now() - groupStarted);
+        planning.advance(index + 1, {
+            phase: "planning", points: ids.length, requestsPlanned: requests.length, rowsPlanned, countQueries
+        });
+    };
 
+    try {
+        for (const [index, group] of groups.entries()) {
+            const groupStarted = Date.now();
+            const groupQueriesBefore = countQueries;
+            const groupRequestsBefore = requests.length;
+            const finishGroup = () => groupPlanned(index, group, groupStarted,
+                requests.slice(groupRequestsBefore), countQueries - groupQueriesBefore);
+            if (!parsed.plannable) {
+                notSent(group, `"${parsed.raw}" is not a range batch.hisDelete can split: use two dates, one date, ` +
+                    "today, yesterday, or two datetimes with seconds and the same timezone name");
+                finishGroup();
+                continue;
+            }
+            // Datetime ends carry their own timezone, so the whole group shares one window. Date-only
+            // ends resolve in each point's timezone, so the group is read once and split by tz.
+            let subGroups = [{ ids: group }];
+            if (parsed.form === "date") {
+                try {
+                    subGroups = await groupByZone((groupIds) => withRetry(() => this.read(groupIds), { retries, retryDelay }), group);
+                } catch (error) {
+                    errors.push({ error: error.message, args: ["countQuery", group, range] });
+                    finishGroup();
+                    continue;
+                }
+            }
+            for (const sub of subGroups) {
+                const window = windowFor(parsed, sub, nowMs);
+                if (window.unsplittable) {
+                    notSent(sub.ids, window.unsplittable);
+                    continue;
+                }
+                // Planning queries retry like deletes: a caller who sets retries expects planning to
+                // ride out the same transient failures.
+                const countFn = async (fromMs, toMs, unit) => {
+                    countQueries++;
+                    const buckets = parseCountResponse(await withRetry(
+                        () => this.query(buildCountQuery(sub.ids, fromMs, toMs, unit)), { retries, retryDelay }), unit);
+                    this.logger.trace("batch.hisDelete: count by %s over %s..%s for %d points: %d buckets, %d rows",
+                        unit, new Date(fromMs).toISOString(), new Date(toMs).toISOString(), sub.ids.length,
+                        buckets.length, buckets.reduce((n, b) => n + b.count, 0));
+                    return buckets;
+                };
+                let plan;
+                try {
+                    plan = await planGroup(countFn, sub.ids, parsed, window, resolved);
+                } catch (error) {
+                    errors.push({ error: error.message, args: ["countQuery", sub.ids, range] });
+                    continue;
+                }
+                if (plan.overBudget) {
+                    notSent(sub.ids, plan.overBudget);
+                } else {
+                    requests.push(...plan.requests);
+                }
+            }
+            finishGroup();
+        }
+    } finally {
+        planning.release();
+    }
+    this.logger.info("batch.hisDelete: planned %d requests, %d rows from %d count queries in %d ms",
+        requests.length, rowsPlanned, countQueries, Date.now() - planningStarted);
+
+    // Resolves to the request's outcome for progress reporting: ok, the retries used (including
+    // any bisected halves') and, on failure, the last error.
     const runRequest = async (req) => {
+        let retriesUsed = 0;
+        const onRetry = (error) => {
+            retriesUsed++;
+            this.logger.debug("batch.hisDelete: delete over %s failed, retry %d: %s",
+                req.range, retriesUsed, error && error.message);
+        };
         try {
-            const res = await withRetry(() => this.hisDelete(req.ids, req.range), { retries, retryDelay });
+            this.logger.trace("batch.hisDelete: deleting %s for %d points (%d rows planned)",
+                req.range, req.ids.length, req.rows || 0);
+            const res = await withRetry(() => this.hisDelete(req.ids, req.range), { retries, retryDelay, onRetry });
             if (returnResult) {
                 success.push(res);
             }
+            return { ok: true, retries: retriesUsed };
         } catch (error) {
             const halves = isRecordLimitError(error) && req.depth < maxBisectDepth ? splitRequest(req) : null;
             if (halves) {
                 this.logger.warn("batch.hisDelete: record limit hit for %s; bisecting (depth %d/%d)",
                     req.range, req.depth + 1, maxBisectDepth);
+                const outcome = { ok: true, retries: retriesUsed };
                 for (const half of halves) {
-                    await runRequest(half);
+                    const halfOutcome = await runRequest(half);
+                    outcome.retries += halfOutcome.retries;
+                    if (!halfOutcome.ok) {
+                        outcome.ok = false;
+                        outcome.error = halfOutcome.error;
+                    }
                 }
-                return;
+                return outcome;
             }
             errors.push({ error: error.message, args: ["hisDelete", req.ids, req.range] });
+            return { ok: false, retries: retriesUsed, error: error.message };
         }
     };
 
@@ -623,7 +926,7 @@ async function hisDelete(ids, range, endOrOptions, maybeOptions) {
     // client-wide performOpInBatch.retries from retrying on top). The receiver is a stand-in so
     // the dispatch name never lands on the shared client instance.
     const runner = Object.create(this);
-    runner.runHisDeleteRequest = runRequest;
+    runner.runHisDeleteRequest = async (req) => ({ ...(await runRequest(req)), size: req.rows || 0 });
     await this.performOpInBatch.call(runner, "runHisDeleteRequest", [[...requests]], {
         batchSize: 1,
         transformer: (batch) => batch[0],
@@ -631,7 +934,13 @@ async function hisDelete(ids, range, endOrOptions, maybeOptions) {
         batchDelay: resolved.batchDelay,
         parallelDelay: resolved.parallelDelay,
         returnResult: false,
-        retries: 0
+        retries: 0,
+        progress: options.progress,
+        label: "hisDelete",
+        unit: "rows",
+        progressPayload: { phase: "deleting", rowsTotal: rowsPlanned },
+        // runRequest records its own failures and retries; report them per request.
+        describe: ({ ok, error, retries: retriesUsed, size }) => ({ ok, error, retries: retriesUsed, size })
     });
 
     return { success, errors };

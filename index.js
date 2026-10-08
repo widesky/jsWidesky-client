@@ -16,6 +16,7 @@ const find = require('./src/graphql/find');
 const HaystackTools = require('./src/utils/haystack');
 const HisWritePayload = require('./src/utils/hisWritePayload');
 const EntityCriteria = require("./src/utils/EntityCriteria");
+const { RequestProgress } = require("./src/utils/requestProgress");
 const {RequestError, HaystackError, GraphQLError, QueueFullError} = require("./src/errors");
 
 /* Exported symbols */
@@ -53,7 +54,8 @@ const jsWideSky = {
     },
     hsTools: HaystackTools,
     HisWritePayload,
-    EntityCriteria
+    EntityCriteria,
+    RequestProgress
 };
 
 module.exports = jsWideSky;

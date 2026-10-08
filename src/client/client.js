@@ -243,7 +243,7 @@ class WideSkyClient {
         this.options = options;
         this.clientOptions = null;
         // Capabilities callers can feature-detect without reading package metadata.
-        this.features = Object.freeze({ hisDeletePlanner: true });
+        this.features = Object.freeze({ hisDeletePlanner: true, batchProgress: true });
         this._impersonate = null;
         this._impersonatePendingEmail = null;
         this._impersonateLookup = null;
