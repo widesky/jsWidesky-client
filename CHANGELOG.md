@@ -28,6 +28,7 @@ This project adheres to [Semantic Versioning](http://semver.org/).
 
 ### Fixed
 - [CORE-9209](https://widesky.atlassian.net/browse/CORE-9209): `batch.hisRead` and `hisRead` return each point's history on that point when a request fails, the points span several requests, or a request holds one point.
+- [CORE-9656](https://widesky.atlassian.net/browse/CORE-9656): axios upgraded to 1.20.0, clearing its 32 known security advisories (12 high), including credential-leak issues.
 
 ## [3.5.0] - 2026-08-13
 
