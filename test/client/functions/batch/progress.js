@@ -399,9 +399,9 @@ describe("client batch operations: progress and request logging", () => {
             ]);
             const planned = logger.info.args.find((a) => a[0].startsWith("batch.hisDelete: planned"));
             expect(planned.slice(1, 4)).to.eql([sent, 2 * 3 * 1440, counts]);
-            const groupLines = logger.debug.args.filter((a) => a[0].startsWith("batch.hisDelete: planned group"));
+            const groupLines = logger.debug.args.filter((a) => a.length > 0 && a[0].startsWith("batch.hisDelete: planned group"));
             expect(groupLines.map((a) => [a[1], a[2], a[3]])).to.eql([[1, 2, 1], [2, 2, 1]]);
-            const traces = logger.trace.args.map((a) => a[0]);
+            const traces = logger.trace.args.filter((a) => a.length > 0).map((a) => a[0]);
             expect(traces.filter((t) => t.startsWith("batch.hisDelete: count by"))).to.have.length(counts);
             expect(traces.filter((t) => t.startsWith("batch.hisDelete: deleting"))).to.have.length(sent);
         });

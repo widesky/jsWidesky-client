@@ -92,12 +92,10 @@ const REDACTED_KEYS = Object.freeze(['authorization', 'password', 'newpassword',
  * Deep copy of a request body or config with every credential-bearing key
  * masked, for logging only. The original object is never modified.
  * @param {*} value
+ * @param {WeakSet} [path] Objects on the current path, for cycle detection.
  * @returns {*}
  */
-function redactForLog(value) {
-    if (Array.isArray(value)) {
-        return value.map(redactForLog);
-    }
+function redactForLog(value, path = new WeakSet()) {
     // Buffers and multipart forms pass through untouched (Buffer is absent
     // in the browser build, hence the typeof guard).
     if (value === null || typeof value !== 'object'
@@ -105,10 +103,20 @@ function redactForLog(value) {
             || typeof value.getBoundary === 'function') {
         return value;
     }
-    const out = {};
-    for (const [key, val] of Object.entries(value)) {
-        out[key] = REDACTED_KEYS.includes(key.toLowerCase()) ? REDACTED : redactForLog(val);
+    if (path.has(value)) {
+        return '[Circular]';
     }
+    path.add(value);
+    let out;
+    if (Array.isArray(value)) {
+        out = value.map((v) => redactForLog(v, path));
+    } else {
+        out = {};
+        for (const [key, val] of Object.entries(value)) {
+            out[key] = REDACTED_KEYS.includes(key.toLowerCase()) ? REDACTED : redactForLog(val, path);
+        }
+    }
+    path.delete(value);
     return out;
 }
 
@@ -892,7 +900,7 @@ class WideSkyClient {
         const uri = this.baseUri + uriPath;
 
         /* istanbul ignore next */
-        if (this.logger) {
+        if (this.logger && this.logger.trace()) {
             this.logger.trace(redactForLog(config), 'Raw request');
         }
 
@@ -1040,7 +1048,9 @@ class WideSkyClient {
         // the retry settles.
         const dispatchWithRetry = async () => {
             this.logger.info("Submitting request [%s] %s", method.toUpperCase(), uri);
-            this.logger.debug("With body %j and config %j", redactForLog(body), redactForLog(config));
+            if (this.logger.debug()) {
+                this.logger.debug("With body %j and config %j", redactForLog(body), redactForLog(config));
+            }
             try {
                 return await this._wsRawSubmit(method, uri, body, config);
             }

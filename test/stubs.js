@@ -20,12 +20,14 @@ const WS_URI = 'http://localhost:3000',
     WS_REFRESH_TOKEN2 = 'another refresh token';
 
 /**
- * StubLogger is a logger object that spoofs a Bunyan-style logger.
+ * StubLogger is a logger object that spoofs a Bunyan-style logger. Every
+ * level reports itself enabled, as Bunyan's `log.debug()` does when called
+ * with no arguments.
  */
 const StubLogger = function() {
     const self = this;
     ['fatal','error','warn','info','debug','trace'].forEach((l) => {
-        self[l] = sinon.stub();
+        self[l] = sinon.stub().returns(true);
     });
     self.resetHistory = () => {
         ['fatal','error','warn','info','debug','trace'].forEach((l) => {

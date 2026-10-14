@@ -92,4 +92,27 @@ describe("client logging: credential redaction", function () {
             expect(text.includes(value), `${name} leaked into logs`).to.equal(false);
         }
     });
+
+    it("logs a self-referencing config as [Circular] without failing the request", async () => {
+        const records = [];
+        const logger = bunyan.createLogger({
+            name: "leak-check",
+            level: "trace",
+            streams: [{ type: "raw", level: "trace", stream: { write: (r) => records.push(r) } }]
+        });
+        const url = `http://127.0.0.1:${server.address().port}`;
+        const ws = new WideSkyClient(url, "ops@example.com", SECRETS.password,
+            "tEYQAFiAAmLrS2Dl", SECRETS.clientSecret, logger);
+
+        // A class instance, so axios passes it through instead of deep-merging it.
+        class Probe {}
+        const probe = new Probe();
+        probe.self = probe;
+
+        await ws.submitRequest("POST", "/api/read", { meta: { ver: "2.0" }, rows: [] }, { probe });
+
+        const text = JSON.stringify(records);
+        expect(text).to.include("[Circular]");
+        expect(text.includes(SECRETS.accessToken), "accessToken leaked into logs").to.equal(false);
+    });
 });
