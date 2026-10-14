@@ -25,6 +25,9 @@ This project adheres to [Semantic Versioning](http://semver.org/).
   - `today`, `yesterday` and a single date are split like a date range, in each point's timezone.
   - Ranges it cannot split within the row limit (mixed forms, no seconds, points without a timezone) are reported and not deleted.
   - `batch.hisDeleteByFilter` uses the same planner, new defaults (500 / 10) and the new options.
+- [CORE-9656](https://widesky.atlassian.net/browse/CORE-9656): Proxy behaviour changes with the axios 1.20 upgrade; check deployments that set a proxy.
+  - HTTPS requests through a proxy (`HTTPS_PROXY` or the `proxy` option) now go over a CONNECT tunnel.
+  - `NO_PROXY` entries match exact host names only; use a leading `.` or `*` to cover subdomains.
 
 ### Fixed
 - [CORE-9209](https://widesky.atlassian.net/browse/CORE-9209): `batch.hisRead` and `hisRead` return each point's history on that point when a request fails, the points span several requests, or a request holds one point.
