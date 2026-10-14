@@ -247,6 +247,8 @@ describe("client.batch.multiFind", () => {
                 "limit": 0,
                 "parallel": 1,
                 "parallelDelay": 0,
+                "retries": 0,
+                "retryDelay": 2000,
                 "returnResult": true
             });
             expect(transformer).to.be.instanceof(Function);
@@ -272,6 +274,8 @@ describe("client.batch.multiFind", () => {
                 "limit": 0,
                 "parallel": 1,
                 "parallelDelay": 0,
+                "retries": 0,
+                "retryDelay": 2000,
                 "returnResult": true
             });
             expect(transformer).to.be.instanceof(Function);

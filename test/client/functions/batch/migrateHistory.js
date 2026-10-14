@@ -19,6 +19,8 @@ const DEFAULT_OPTIONS = {
     "batchSize": 10000,
     "parallel": 1,
     "parallelDelay": 0,
+    "retries": 0,
+    "retryDelay": 2000,
     "returnResult": false
 };
 const HIS_WRITE_PAYLOAD = require("./files/migrateHistory_hisWritePayload.json");

@@ -275,6 +275,8 @@ class WideSkyClient {
         this.logger = initLogger(logger);
         this.options = options;
         this.clientOptions = null;
+        // Capabilities callers can feature-detect without reading package metadata.
+        this.features = Object.freeze({ hisDeletePlanner: true, batchProgress: true });
         this._impersonate = null;
         this._impersonatePendingEmail = null;
         this._impersonateLookup = null;
@@ -1792,9 +1794,13 @@ class WideSkyClient {
                 status.rowTs[ts] = out_row;
             }
 
-            /* Copy the columns in */
+            /* Copy the columns in. The server names the value column `val`
+             * when the block holds one point, and v0..vN for several. */
             for (let c = 0; c < blockIds.length; c++) {
-                const val = in_row['v' + c];
+                let val = in_row['v' + c];
+                if ((val == null) && (blockIds.length === 1)) {
+                    val = in_row.val;
+                }
 
                 if (val != null) {
                     const id = blockIds[c];

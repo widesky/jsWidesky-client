@@ -161,26 +161,36 @@ describe('client', () => {
                         await ws.initClientOptions();
                     });
 
-                    it("progress instance created", async () => {
-                        const fakeProgressInstance = {
-                            update: sinon.stub()
-                        }
-                        ws.progressCreate = sinon.stub().callsFake(() => fakeProgressInstance);
+                    /**
+                     * A fake cli-progress MultiBar, given client-wide as progress.instance.
+                     * @returns {{multiBar: Object, bar: Object}}
+                     */
+                    function fakeMultiBar() {
+                        const bar = {increment: sinon.stub(), stop: sinon.stub()};
+                        const multiBar = {create: sinon.stub().returns(bar), remove: sinon.stub()};
+                        return {multiBar, bar};
+                    }
+
+                    it("creates one counter per operation, counting its requests", async () => {
+                        const {multiBar} = fakeMultiBar();
+                        ws.clientOptions.progress.instance = multiBar;
                         ws.test = () => {};
-                        await ws.performOpInBatch("test", [[1, 2, 3]]);
-                        expect(ws.progressCreate.calledOnce).to.be.true;
-                        expect(ws.progressCreate.args[0]).to.eql([3]);
+                        await ws.performOpInBatch("test", [[1, 2, 3]], {batchSize: 2});
+                        expect(multiBar.create.calledOnce).to.be.true;
+                        // 3 items in batches of 2: 2 requests.
+                        expect(multiBar.create.args[0].slice(0, 2)).to.eql([2, 0]);
                     });
 
-                    it("progress instance updated", async () => {
-                        const fakeProgressInstance = {
-                            update: sinon.stub()
-                        }
-                        ws.progressCreate = sinon.stub().callsFake(() => fakeProgressInstance);
+                    it("advances the counter once per completed request, then removes it", async () => {
+                        const {multiBar, bar} = fakeMultiBar();
+                        ws.clientOptions.progress.instance = multiBar;
                         ws.test = () => {};
-                        await ws.performOpInBatch("test", [[1, 2, 3]]);
-                        expect(fakeProgressInstance.update.calledOnce).to.be.true;
-                        expect(fakeProgressInstance.update.args[0]).to.eql([3]);
+                        await ws.performOpInBatch("test", [[1, 2, 3]], {batchSize: 1});
+                        expect(bar.increment.callCount).to.equal(3);
+                        expect(bar.increment.args.map((a) => a[0])).to.eql([1, 1, 1]);
+                        expect(bar.increment.args[2][1]).to.include({ok: true, sizeDone: 3, failed: 0});
+                        expect(bar.stop.calledOnce).to.be.true;
+                        expect(multiBar.remove.calledOnceWith(bar)).to.be.true;
                     });
                 });
 
@@ -197,13 +207,12 @@ describe('client', () => {
                     });
 
                     it("progress instance not created", async () => {
-                        const fakeProgressInstance = {
-                            update: sinon.stub()
-                        }
-                        ws.progressCreate = sinon.stub().callsFake(() => fakeProgressInstance);
-                        ws.test = () => {};
+                        const multiBar = {create: sinon.stub(), remove: sinon.stub()};
+                        ws.clientOptions.progress.instance = multiBar;
+                        ws.test = sinon.stub();
                         await ws.performOpInBatch("test", [[1, 2, 3]]);
-                        expect(ws.progressCreate.notCalled).to.be.true;
+                        expect(ws.test.calledOnce).to.be.true;
+                        expect(multiBar.create.notCalled).to.be.true;
                     });
                 });
             });
