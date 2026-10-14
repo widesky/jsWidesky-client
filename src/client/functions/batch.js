@@ -16,6 +16,11 @@ const {
     BATCH_MULTI_FIND_SCHEMA,
     BATCH_UPDATE_OR_CREATE_SCHEMA
 } = require("../../utils/evaluator");
+const lodash = require("lodash");
+const {
+    parseRange, groupByZone, windowFor, buildCountQuery, parseCountResponse, planGroup, splitRequest
+} = require("./hisDeletePlan");
+const { withRetry, isRecordLimitError } = require("./batchRetry");
 const HisWritePayload = require("../../utils/hisWritePayload");
 const { sleep } = require("../../utils/tools");
 const Hs = require("../../utils/haystack");
@@ -67,11 +72,14 @@ function isRowsSorted(rows) {
  * @param batchSize Maximum size of each batch. For Objects, it's the number of key-value pairs found in the Object
  *                  of each attribute specified in the Object. For Arrays, its number of elements.
  * @param transformer A transformer for the batched arguments.
- * @returns {{p1, hasMore: (function(): boolean), getNext}}
+ * @returns {{count: number, items: number, hasMore: (function(): boolean), getNext}} count is the
+ *     number of requests the payload makes, items the size of the payload.
  */
 function createBatchIterator(op, payload, clientArgs, batchSize, transformer, batchSizeEntity) {
-    let hasMore, getNext, p1;
+    let hasMore, getNext, count, items;
     if (Array.isArray(payload)) {
+        count = Math.ceil(payload.length / batchSize);
+        items = payload.length;
         getNext = () => {
             const next = payload.splice(0, batchSize);
             if (op === "hisDelete") {
@@ -88,10 +96,6 @@ function createBatchIterator(op, payload, clientArgs, batchSize, transformer, ba
             }
         };
         hasMore = () => payload.length > 0;
-
-        if (this.isProgressEnabled) {
-            p1 = this.progressCreate(payload.length);
-        }
     } else if (typeof payload === "object") {
         // check if structure is as expected
         for (const [key, valueAsObject] of Object.entries(payload)) {
@@ -105,6 +109,8 @@ function createBatchIterator(op, payload, clientArgs, batchSize, transformer, ba
         const keyValueLength = payloadKeys.map((key) => Object.keys(payload[key]).length);
         const keyValueRemaining = [...keyValueLength];
         let currKeyIndex = 0;
+        count = countObjectRequests(keyValueLength, batchSize, entityCap);
+        items = keyValueLength.reduce((n, length) => n + length, 0);
         getNext = () => {
             // get next set using batchSize as maximum number of rows, not inclusive of the key,
             // and batchSizeEntity as maximum number of distinct top-level keys in the batch.
@@ -164,48 +170,260 @@ function createBatchIterator(op, payload, clientArgs, batchSize, transformer, ba
             }
             return currKeyIndex !== payloadKeys.length && keyValueLength[currKeyIndex] !== 0
         };
-
-        if (this.isProgressEnabled) {
-            p1 = this.progressCreate(Object.keys(payload).length);
-        }
     } else {
         throw new Error("First element of parameter should be of type Array or Object");
     }
 
-    return { hasMore, getNext, p1 };
+    return { hasMore, getNext, count, items };
 }
 
 /**
- * Create a request with success and error handlers.
- * @param op Client function to be performed.
- * @param args Arguments to be called for the client operation.
- * @param result Result Object to append success or error responses to.
- * @param returnResult If true, append the result of the operation to result.success. Do nothing otherwise.
- * @returns {Promise<unknown>}
+ * The number of requests an Object payload makes, worked out from its row counts alone so that
+ * nothing is copied: the same packing as createBatchIterator's getNext.
+ * @param {number[]} lengths Rows under each top-level key, in key order.
+ * @param {number} batchSize Most rows in one request.
+ * @param {number} entityCap Most top-level keys in one request.
+ * @returns {number} The number of requests.
  */
-function createBatchRequest(op, args, result, returnResult) {
-    return new Promise(async (resolve) => {
-        try {
-            const res = await this[op](...args);
-            if (returnResult) {
-                result.success.push(res);
+function countObjectRequests(lengths, batchSize, entityCap) {
+    const remaining = [...lengths];
+    let index = 0;
+    let requests = 0;
+    const skipEmpty = () => {
+        while (index < remaining.length && remaining[index] === 0) index++;
+    };
+    skipEmpty();
+    while (index < remaining.length) {
+        let rows = 0;
+        let entities = 0;
+        while (rows < batchSize && entities < entityCap && index < remaining.length) {
+            if (remaining[index] === 0) {
+                index++;
+                continue;
             }
-        } catch (error) {
-            result.errors.push({
-                error: error.message,
-                args: [op, ...args]
-            });
-        } finally {
-            resolve();
+            const taken = Math.min(remaining[index], batchSize - rows);
+            remaining[index] -= taken;
+            rows += taken;
+            entities++;
+            if (remaining[index] === 0) index++;
         }
-    });
+        requests++;
+        skipEmpty();
+    }
+    return requests;
+}
+
+/**
+ * One progress counter on the call's reporter (or the client-wide one), with the reporter's
+ * failures contained: a reporter is the caller's code, so a failure in it is logged once and
+ * never changes the result of the batch operation.
+ * @param {string} label Operation name used in the log lines, e.g. "hisWrite".
+ * @param {number} total The counter's total.
+ * @param {Object} [progress] Per-call progress reporter (cli-progress MultiBar interface, e.g.
+ *     RequestProgress); the client-wide `progress` configuration is used when absent.
+ * @param {Object} [payload] Details given to the counter when it is created.
+ * @returns {{advance: function(number, Object): void, release: function(): void}}
+ */
+function createProgressCounter(label, total, progress, payload) {
+    const logger = this.logger;
+    let reporter = null;
+    if (progress && typeof progress.create === "function") {
+        reporter = { instance: progress, create: "create", increment: "increment", update: "update" };
+    } else if (this.isProgressEnabled) {
+        const { instance, create, increment, update } = this.clientOptions.progress;
+        reporter = { instance, create, increment, update };
+    }
+    let reporterFailed = false;
+    const report = (what, fn) => {
+        if (reporterFailed) return undefined;
+        try {
+            return fn();
+        } catch (error) {
+            reporterFailed = true;
+            if (logger) {
+                logger.warn("batch.%s: progress reporter failed on %s, not reporting further: %s",
+                    label, what, error.message);
+            }
+            return undefined;
+        }
+    };
+    const bar = reporter ? report("create", () => reporter.instance[reporter.create](total, 0, { ...payload })) : null;
+
+    return {
+        /**
+         * Advance the counter to `done`.
+         * @param {number} done Steps completed so far.
+         * @param {Object} details Payload for this step.
+         */
+        advance(done, details) {
+            if (!bar) return;
+            report("increment", () => {
+                // Counters that only implement update (the earlier client-wide contract).
+                if (typeof bar[reporter.increment] === "function") {
+                    bar[reporter.increment](1, details);
+                } else {
+                    bar[reporter.update](done, details);
+                }
+            });
+        },
+        /**
+         * Stop the counter and remove it from its reporter.
+         */
+        release() {
+            if (!bar) return;
+            // Released even after the reporter failed, so a reused reporter keeps no counter.
+            try {
+                report("stop", () => {
+                    if (typeof bar.stop === "function") bar.stop();
+                });
+            } finally {
+                try {
+                    if (typeof reporter.instance.remove === "function") reporter.instance.remove(bar);
+                } catch (error) {
+                    if (logger) {
+                        logger.warn("batch.%s: progress reporter failed to remove its counter: %s",
+                            label, error.message);
+                    }
+                }
+            }
+        }
+    };
+}
+
+/**
+ * Track the requests of one batch operation: log each as it is sent (trace), retried (debug) and
+ * completed (debug), advance the progress counter, and log a summary when the operation ends
+ * (debug).
+ * @param {string} label Operation name used in the log lines, e.g. "hisWrite".
+ * @param {number} total Requests the operation makes.
+ * @param {Object} [progress] Per-call progress reporter; see createProgressCounter.
+ * @param {Object} [payload] Details given to the counter when it is created.
+ * @param {string} unit What a request's size counts, for the log lines.
+ * @returns {{sent: function(number, number): void, retried: function(number, number, *): void,
+ *     complete: function(Object): void, finish: function(): void}}
+ */
+function createRequestTracker(label, total, progress, payload, unit) {
+    const logger = this.logger;
+    const counter = createProgressCounter.call(this, label, total, progress, payload);
+    const started = Date.now();
+    let done = 0;
+    let failed = 0;
+    let size = 0;
+    let sizeOk = 0;
+
+    return {
+        /**
+         * Record a request being sent.
+         * @param {number} number The request's number, from 1.
+         * @param {number} requestSize Items in the request.
+         */
+        sent(number, requestSize) {
+            if (logger) {
+                logger.trace("batch.%s: sending request %d/%d, %d %s", label, number, total, requestSize, unit);
+            }
+        },
+        /**
+         * Record a retry of a request after a transient failure.
+         * @param {number} number The request's number, from 1.
+         * @param {number} attempt The retry about to be made, from 1.
+         * @param {*} error The failure being retried.
+         */
+        retried(number, attempt, error) {
+            if (logger) {
+                logger.debug("batch.%s: request %d/%d failed, retry %d: %s",
+                    label, number, total, attempt, error && error.message);
+            }
+        },
+        /**
+         * Record a completed request.
+         * @param {{ok: boolean, error?: string, size: number, retries: number, durationMs: number}} outcome
+         */
+        complete(outcome) {
+            done++;
+            size += outcome.size || 0;
+            if (outcome.ok) {
+                sizeOk += outcome.size || 0;
+            } else {
+                failed++;
+            }
+            if (logger) {
+                const retries = outcome.retries === 1 ? "1 retry" : `${outcome.retries} retries`;
+                if (outcome.ok) {
+                    logger.debug("batch.%s: request %d/%d ok in %d ms, %s, %d %s",
+                        label, done, total, outcome.durationMs, retries, outcome.size, unit);
+                } else {
+                    logger.debug("batch.%s: request %d/%d failed in %d ms, %s: %s",
+                        label, done, total, outcome.durationMs, retries, outcome.error);
+                }
+            }
+            counter.advance(done, {
+                ...payload,
+                ok: outcome.ok,
+                error: outcome.error,
+                size: outcome.size,
+                sizeDone: size,
+                sizeOk,
+                retries: outcome.retries,
+                durationMs: outcome.durationMs,
+                failed
+            });
+        },
+        /**
+         * Log the summary and release the progress counter.
+         */
+        finish() {
+            if (logger) {
+                logger.debug("batch.%s: %d/%d requests done (%d failed), %d %s in %d ms",
+                    label, done, total, failed, size, unit, Date.now() - started);
+            }
+            counter.release();
+        }
+    };
+}
+
+/**
+ * Send one batched request, retrying it after a transient failure.
+ * @param {string} op Client function to be performed.
+ * @param {Array} args Arguments to be called for the client operation.
+ * @param {{retries: number, retryDelay: number}} retry Extra attempts after a transient failure (see
+ *     batchRetry.withRetry) and the milliseconds before each. Only the final failure is reported.
+ * @param {number} size Items in the request.
+ * @param {Object} tracker The operation's request tracker (see createRequestTracker).
+ * @param {function(*): Object} [describe] Maps a response to outcome fields that override the
+ *     defaults, for an op that records its own failures (batch.hisDelete).
+ * @param {number} number The request's number within the operation, from 1.
+ * @returns {Promise<{res: *}|{error: {error: string, args: Array}}>} The response, or the error entry to report.
+ *     Never rejects, so the caller can record outcomes in request order once a parallel group settles.
+ */
+async function createBatchRequest(op, args, retry, size, tracker, describe, number) {
+    const started = Date.now();
+    let retries = 0;
+    const onRetry = (error) => {
+        retries++;
+        tracker.retried(number, retries, error);
+    };
+    tracker.sent(number, size);
+    let outcome;
+    try {
+        outcome = { res: await withRetry(() => this[op](...args), { ...retry, onRetry }) };
+    } catch (error) {
+        outcome = { error: { error: error.message, args: [op, ...args] } };
+    }
+    // Reported outside the request's try: only the request decides its outcome.
+    const durationMs = Date.now() - started;
+    if (outcome.error) {
+        tracker.complete({ ok: false, error: outcome.error.error, size, retries, durationMs });
+    } else {
+        tracker.complete({ ok: true, size, retries, durationMs, ...(describe ? describe(outcome.res) : {}) });
+    }
+    return outcome;
 }
 
 /**
  * Perform a WideSky client operation in batches or in parallel.
- * @param op Function to be called on the client instance.
- * @param args An Array of arguments to be passed to the client. The first index must be the batch'able payload.
- * @param options An Object of options available to configure the operation. These include:
+ * @param {string} op Function to be called on the client instance.
+ * @param {Array} args An Array of arguments to be passed to the client. The first index must be the batch'able payload.
+ * @param {Object} [options] An Object of options available to configure the operation. These include:
  *                - batchSize: Size of each batch sent to API server. For a payload of type Object, this is the \
  *                             number of keys.
  *                - batchDelay: Delay in milliseconds between the completion of a request and the next request to be
@@ -213,7 +431,13 @@ function createBatchRequest(op, args, result, returnResult) {
  *                - parallel: Number of batched requests to run in parallel.
  *                - parallelDelay: Delay in milliseconds between each set of parallel requests.
  *                - returnResult: Enable or disable returning the result of the queries sent.
+ *                - retries: Extra attempts for a request after a transient failure (5xx in 500/502/503/504 or a
+ *                           network error). 0 (default) disables retry.
+ *                - retryDelay: Delay in milliseconds before each extra attempt.
  *                - transformer: A function to transform the payload to be passed to the client operation.
+ *                - progress: A progress reporter for this call (cli-progress MultiBar interface, e.g.
+ *                            RequestProgress). Its counter counts requests, advances as each completes and
+ *                            is removed when the operation ends. Defaults to the client-wide `progress`.
  * @returns {Promise<{success: Array, errors: Array<{errors: String, args: Array}>}>}
  *          - success: Contain the responses of successful operations when options.returnResult is true.
  *          - errors: Contain an errors encountered when performing operations.
@@ -227,10 +451,17 @@ async function performOpInBatch(op, args, options={}) {
         batchDelay,
         returnResult,
         parallel,
-        parallelDelay
+        parallelDelay,
+        retries,
+        retryDelay
     } = deriveFromDefaults(this.clientOptions.performOpInBatch, options);
 
     let { transformer } = options;
+    // label, unit, describe and progressPayload are internal: set by batch functions that wrap
+    // their own request runner (batch.hisDelete).
+    const { progress, describe, progressPayload } = options;
+    const label = options.label || op;
+    const unit = options.unit || "items";
     if (transformer == null) {
         // no transformation
         transformer = (val) => val;
@@ -242,40 +473,60 @@ async function performOpInBatch(op, args, options={}) {
     }
     const payload = args[0];
     const clientArgs = args.slice(1);
+    // Whole numbers of items and entities per request: the schema accepts fractions, which the
+    // Array and Object iterators would otherwise round differently from the request count.
+    const wholeBatchSize = Math.floor(batchSize);
+    const wholeBatchSizeEntity = batchSizeEntity == null ? batchSizeEntity : Math.floor(batchSizeEntity);
     const result = {
         errors: [],
         success: []
     };
-    const { getNext, hasMore, p1 } = createBatchIterator.call(
-        this, op, payload, clientArgs, batchSize, transformer, batchSizeEntity
+    const { getNext, hasMore, count, items } = createBatchIterator.call(
+        this, op, payload, clientArgs, wholeBatchSize, transformer, wholeBatchSizeEntity
     );
     if (!hasMore()) {
+        this.logger.debug("batch.%s: nothing to send", label);
         return result;
     }
 
-    let added = 0;
-    while (hasMore()) {
-        let sizeTotal = 0;
-        const requests = [];
+    // A wrapping batch function (batch.hisDelete) counts its own rows: its payload is requests.
+    const itemTotal = unit === "items" ? items : (progressPayload && progressPayload.rowsTotal) || 0;
+    // Start and summary are debug, not info: batch operations run all day on edge engines (every
+    // history write), whose client logs at info by default.
+    this.logger.debug("batch.%s: sending %d requests, %d %s (batch size %d, parallel %d, delay %d ms, " +
+        "retries %d)", label, count, itemTotal, unit, wholeBatchSize, parallel, batchDelay || 0, retries || 0);
+    const tracker = createRequestTracker.call(this, label, count, progress, progressPayload, unit);
+    let sentCount = 0;
+    try {
+        while (hasMore()) {
+            const requests = [];
 
-        // queue parallel requests
-        for (let i = 0; i < parallel && hasMore(); i++) {
-            const { next, size } = getNext();
-            sizeTotal += size;
-            requests.push(createBatchRequest.call(this, op, next, result, returnResult));
-            if (batchDelay > 0) {
-                await sleep(batchDelay);
+            // queue parallel requests
+            for (let i = 0; i < parallel && hasMore(); i++) {
+                const { next, size } = getNext();
+                requests.push(createBatchRequest.call(
+                    this, op, next, { retries, retryDelay }, size, tracker, describe, ++sentCount
+                ));
+                if (batchDelay > 0) {
+                    await sleep(batchDelay);
+                }
+            }
+            // Record in request order, not completion order: a retried request finishes after its peers,
+            // and hisRead / multiFind read success by position.
+            for (const outcome of await Promise.all(requests)) {
+                if (outcome.error) {
+                    result.errors.push(outcome.error);
+                } else if (returnResult) {
+                    result.success.push(outcome.res);
+                }
+            }
+
+            if (parallelDelay > 0)  {
+                await sleep(parallelDelay);
             }
         }
-        await Promise.all(requests);
-
-        if (this.isProgressEnabled) {
-            p1[this.clientOptions.progress.update](added += sizeTotal);
-        }
-
-        if (parallelDelay > 0)  {
-            await sleep(parallelDelay);
-        }
+    } finally {
+        tracker.finish();
     }
 
     return result;
@@ -319,6 +570,25 @@ async function hisWrite(hisWriteData, options={}) {
 }
 
 /**
+ * The position, within its request, of the point a hisRead response column holds.
+ * @param {string} name Column name from the response row (not "ts").
+ * @param {number} requested Number of points in the request.
+ * @returns {number|null} The point's position in the request, or null when the column matches none of them.
+ *     The API server names the value column "val" when one point is read and "v0".."vN" for several.
+ */
+function hisReadColumn(name, requested) {
+    if (name === "val") {
+        return requested === 1 ? 0 : null;
+    }
+    const match = /^v(\d+)$/.exec(name);
+    if (match === null) {
+        return null;
+    }
+    const position = Number(match[1]);
+    return position < requested ? position : null;
+}
+
+/**
  * Perform a history read request using batch functionality.
  * @param   ids Entities to read.
  * @param   from Haystack read range or a Date Object representing where to grab historical data from.
@@ -345,12 +615,29 @@ async function hisRead(ids, from, to, options={}) {
         }
     );
 
-    // process hisRead data
+    // process hisRead data. Requests cover consecutive slices of ids, and success / errors are both
+    // in request order, so walking the slices places each response on its own ids: a failed slice
+    // keeps its ids empty, and a value column ("val" for one point, "vN" for several) is relative to
+    // the slice it came from.
     const resultByEntity = init2DArray(ids.length);
-    for (let i = 0; i < data.length; i++) {
-        const res = data[i];
+    // Request errors plus any response that cannot be mapped, in request order.
+    const orderedErrors = [];
+    let nextSuccess = 0;
+    let nextError = 0;
+    for (let start = 0; start < ids.length; start += options.batchSize) {
+        const slice = ids.slice(start, start + options.batchSize);
+        const failed = errors[nextError];
+        if (failed && lodash.isEqual(failed.args[1], slice)) {
+            orderedErrors.push(failed);
+            nextError++;
+            continue;
+        }
+        const res = data[nextSuccess++];
+        if (res === undefined) {
+            break;
+        }
         if (ids.length === 1 || options.batchSize === 1) {
-            resultByEntity[i] = res.rows;
+            resultByEntity[start] = res.rows;
         } else {
             if (!isRowsSorted(res.rows)) {
                 // issues found with rows not being sorted by their respective time stamp
@@ -370,15 +657,30 @@ async function hisRead(ids, from, to, options={}) {
                 });
             }
 
+            const unmapped = new Set();
+            for (const row of res.rows) {
+                for (const name of Object.keys(row)) {
+                    if (name !== "ts" && hisReadColumn(name, slice.length) === null) {
+                        unmapped.add(name);
+                    }
+                }
+            }
+            if (unmapped.size > 0) {
+                // Never drop rows silently: the slice is reported and its points keep no rows.
+                orderedErrors.push({
+                    error: `hisRead response has column(s) ${[...unmapped].join(", ")} matching none of the ` +
+                        `${slice.length} requested point(s)`,
+                    args: ["hisRead", slice, from, to, options.batchSize]
+                });
+                continue;
+            }
+
             for (const row of res.rows) {
                 const { ts } = row;
-                for (const [vId, val] of Object.entries(row)) {
-                    if (vId === "ts") {
-                        continue;
+                for (const [name, val] of Object.entries(row)) {
+                    if (name !== "ts") {
+                        resultByEntity[start + hisReadColumn(name, slice.length)].push({ts, val});
                     }
-
-                    const index = Number(vId.slice(1));
-                    resultByEntity[index].push({ts, val});
                 }
             }
         }
@@ -386,303 +688,262 @@ async function hisRead(ids, from, to, options={}) {
 
     return {
         success: resultByEntity,
-        errors: errors
+        errors: orderedErrors
     };
 }
 
+const HIS_DELETE_OPTION_KEYS = [
+    "batchSize", "batchSizeEntity", "maxBisectDepth", "countBucketUnits",
+    "retries", "retryDelay", "parallel", "batchDelay", "parallelDelay"
+];
+
 /**
- * Find the number of rows between the given times timeStart and timeEnd.
- * @param data Data to search within.
- * @param timeStart Starting epoch time range.
- * @param timeEnd Ending epoch time range.
- * @returns {number} Number of time series rows found.
+ * Split ids into consecutive groups of at most `size`, keeping their order.
+ * @param {string[]} ids Point ids.
+ * @param {number} size Largest group (batchSizeEntity).
+ * @returns {string[][]}
  */
-function rowsBetweenRange(data, timeStart, timeEnd) {
-    let i = 0;
-    let count = 0;
-    const getDate = (ts) => Date.parse(Hs.removePrefix(ts));
-    while (data[i] && getDate(data[i].ts) < timeStart) {
-        i++;
+function chunkIds(ids, size) {
+    const groups = [];
+    for (let i = 0; i < ids.length; i += size) {
+        groups.push(ids.slice(i, i + size));
     }
-
-    if (data[i] === undefined) {
-        // found start point exceeds data sets endpoint. No data between time range
-        return 0;
-    }
-
-    for (; i < data.length; i++) {
-        if (data[i] === undefined || getDate(data[i].ts) > timeEnd) {
-            break;
-        }
-        count++;
-    }
-
-    return count;
+    return groups;
 }
 
 /**
- * Get the end time in the data set that has at most the given batchSize records.
- * @param dataSet Data set to search in.
- * @param grabFromIndex A start index to signify what will be batched next.
- * @param batchSize Maximum number of time series data that can be deleted.
- * @returns {number|null} The index of the endRange time found. If data set is empty, null is returned.
+ * Delete history in bounded requests planned from GraphQL COUNT histograms.
+ *
+ * Planning never reads the rows being deleted: each group of `batchSizeEntity` ids is counted
+ * per `countBucketUnits[0]`, over-budget buckets are re-counted at finer units, and buckets are
+ * packed into contiguous requests of at most `batchSize` rows in total, over at most
+ * min(batchSizeEntity, batchSize) points. A bucket still over budget at the finest unit is halved
+ * and re-counted exactly until it fits. A plan that needs one request sends the caller's range
+ * verbatim ("today" / "yesterday" as the planned datetimes). A split plan keeps every request in
+ * one range form the API server accepts (see hisDeletePlan.parseRange):
+ *   - both ends "...Z": boundaries are ISO "Z" instants, first/last keep the caller's tokens;
+ *   - both ends "<offset> <TzName>" with the same name: boundaries in that zone with that name;
+ *   - both ends dates: each group is read once and split by point timezone; both ends become
+ *     local-midnight datetimes with the point's tz name (end = the day after the end date),
+ *     written with the real offset in a whole-hour zone, or as local wall time + "+00:00 <Name>"
+ *     in a zone with a part-hour offset in the window (the server misreads "+09:30"; see
+ *     hisDeletePlan.wallTimeForm).
+ *   - "today" / "yesterday" and a single date plan like two dates, the keyword's date taken per
+ *     point timezone when the call starts.
+ * Any other range (one datetime, mixed forms, a missing offset, seconds or tz name, two tz names,
+ * "Z <Name>" for a zone other than UTC, "+00:00 <Name>" while that zone is not at UTC+0), a date
+ * range on a point with no usable tz, a named range in a zone with a part-hour offset, a date or
+ * named range containing a sub-hour DST change, and a group whose rows in a repeated DST hour
+ * exceed batchSize, is not sent: each such group gets a "plan" error and keeps its rows.
+ *
+ * @param {string|string[]} ids Point ids (array or single id).
+ * @param {string|Date} range Haystack range string (with or without "s:"), or a Date for the start.
+ * @param {Date|Object} [endOrOptions] Date end (not inclusive) when `range` is a Date; otherwise the
+ *     options, with the keys listed under maybeOptions.
+ * @param {Object} [maybeOptions] Options when called with two Dates. See docs/client/batch.md.
+ * @param {number} [maybeOptions.batchSize=500] Most rows in one request, summed over its points.
+ * @param {number} [maybeOptions.batchSizeEntity=10] Most point ids in one request.
+ * @param {number} [maybeOptions.maxBisectDepth=5] Times a request the server rejects for its row
+ *     limit may be halved.
+ * @param {string[]} [maybeOptions.countBucketUnits=["DAY","HOUR","MINUTE"]] Histogram units, coarsest first.
+ * @param {number} [maybeOptions.retries=0] Extra attempts after a transient failure.
+ * @param {number} [maybeOptions.retryDelay=2000] Milliseconds before each extra attempt.
+ * @param {number} [maybeOptions.parallel] Requests in flight at once.
+ * @param {number} [maybeOptions.batchDelay] Milliseconds between requests.
+ * @param {number} [maybeOptions.parallelDelay] Milliseconds between parallel starts.
+ * @param {boolean} [maybeOptions.returnResult=false] Collect each delete response in `success`.
+ * @returns {Promise<{success: Array, errors: Array<{error: String, args: Array}>}>}
+ *          errors[].args[0] is "hisDelete" for a failed delete, "countQuery" for a failed
+ *          count (the group is not deleted), and "plan" for a range or group that cannot be cut
+ *          within batchSize (nothing is sent for it).
  */
-function endTimeRange(dataSet, grabFromIndex, batchSize) {
-    if (dataSet.length === 0 || grabFromIndex >= dataSet.length) {
-        return null;
-    }
-
-    let i = grabFromIndex;
-    while (i < dataSet.length - 1 && i - grabFromIndex + 1 < batchSize) {
-        i++;
-    }
-
-    if (i > dataSet.length - 1) {
-        // gone over. Select the end
-        i = dataSet.length - 1
-    }
-
-    return Date.parse(Hs.removePrefix(dataSet[i].ts));
-}
-
-/**
- * Find the time for which either the maximum number of time series rows are deleted or the batchSize of rows has been
- * reached.
- * @param timeRanges Array of Objects with property "endRange".
- * @param dataSet Data to search for the number of time series to be deleted from.
- * @param grabFrom Time stamp to grab from.
- * @param batchSize Maximum size of each batch.
- * @returns {{endRange, deleteRowCounts: number}} Return endRange to delete till and the number of rows to delete from
- *                                                each data set.
- */
-function getMinIndex(timeRanges, dataSet, grabFrom, batchSize) {
-    const sortByRange = timeRanges
-        .filter((range) => range !== null)
-        .sort((rangeA, rangeB) => {
-            if (rangeA < rangeB) {
-                return -1;
-            } else if (rangeA > rangeB) {
-                return 1;
-            } else {
-                return 0;
-            }
-        });
-
-    let curMax, endRange, deleteRowCounts;
-    for (let i = 0; i < sortByRange.length; i++) {
-        if (curMax === undefined) {
-            endRange = sortByRange[i];
-            deleteRowCounts = dataSet
-                .map((data) => rowsBetweenRange(data, grabFrom, sortByRange[i]));
-            curMax = Math.max(...deleteRowCounts);
-            if (curMax > batchSize) {
-                // this ain't it chief
-                curMax = undefined;
-                continue;
-            } else if (curMax === batchSize) {
-                // already at maximum batch size
-                break;
-            } else {
-                continue;
-            }
-        }
-
-        const getDataCount = dataSet.map((data) =>
-            rowsBetweenRange(data, grabFrom, sortByRange[i]));
-        const maxDataCount = Math.max(...getDataCount);
-        if (maxDataCount === batchSize) {
-            // we're at max
-            deleteRowCounts = getDataCount;
-            curMax = maxDataCount;
-            endRange = sortByRange[i];
-            break;
-        } else if (batchSize >= maxDataCount && maxDataCount > curMax ) {
-            deleteRowCounts = getDataCount;
-            curMax = maxDataCount;
-            endRange = sortByRange[i];
-        }
-    }
-
-    return { endRange, deleteRowCounts };
-}
-/**
- * Determine if all time series data has been accounted for.
- * @returns {boolean} True if there is more data to work with. False if not.
- */
-function allAccountedFor(data, recordIndexes) {
-    for (let i = 0; i < recordIndexes.length; i++) {
-        if (data[i].length > recordIndexes[i]) {
-            return false;
-        }
-    }
-
-    return true;
-}
-
-/**
- * Find the earliest time range in the historical data.
- * @param data Data to search within.
- * @returns {Date} Date of the earlier time series found.
- */
-function findStartTime(data) {
-    let startTime = null;
-    for (const dataSet of data) {
-        if (dataSet.length > 0) {
-            if (startTime === null) {
-                startTime = Date.parse(Hs.removePrefix(dataSet[0].ts));
-                continue;
-            }
-            const firstTime = Date.parse(Hs.removePrefix(dataSet[0].ts));
-            if (firstTime < startTime) {
-                startTime = firstTime;
-            }
-        }
-    }
-
-    return new Date(startTime);
-}
-
-/**
- * Create hisDelete time ranges to remove all the data given and append them to the given batch.
- * @param data Data to create time ranges for.
- * @param ids Entity IDs for who their data will be deleted.
- * @param batch The current batch to append hisDelete arguments to.
- * @param batchSize The maximum number of time series rows to be deleted per hisDelete range.
- * @param startTime The earliest time to be deleted.
- * @param timeEnd The requested end time range.
- */
-function createTimeRanges(data, ids, batch, batchSize, startTime, timeEnd) {
-    let grabFrom = startTime;
-    const recordIndexes = new Array(ids.length).fill(0);
-    while (!allAccountedFor(data, recordIndexes)) {
-        const timeRanges = recordIndexes.map((_, index) =>
-            endTimeRange(data[index], recordIndexes[index], batchSize));
-        const { endRange, deleteRowCounts} = getMinIndex(timeRanges, data, grabFrom.valueOf(), batchSize);
-        // ensure time range is inclusive of data to be deleted (i.e. +1ms)
-        const grabTo = new Date(endRange + 1);
-        if (grabTo.getTime() > timeEnd.getTime()) {
-            // end of the line
-            batch.push([ids, `s:${grabFrom.toISOString()},${timeEnd.toISOString()}`]);
-            break;
-        } else {
-            batch.push([ids, `s:${grabFrom.toISOString()},${grabTo.toISOString()}`]);
-        }
-
-        grabFrom = grabTo;
-
-        // update starting indexes
-        for (let i = 0; i < recordIndexes.length; i++) {
-            if (deleteRowCounts[i] !== 0) {
-                recordIndexes[i] += deleteRowCounts[i];
-            }
-        }
-    }
-}
-
-/**
- * Perform a history delete request using batch functionality. A hisRead will be performed for the ids and range given
- * to determine how the hisDelete ranges should be split to have at most options.batchSize time series rows deleted.
- * The option batchSizeEntity will also impact the number of entities involved when performing a hisRead operation.
- * @param ids An array of point entity UUIDs for the delete operations or a single string. These will be batched by
- *            options.batchSizeEntity.
- * @param timeStart Starting timestamp to be deleted as a Date Object.
- * @param timeEnd Ending timestamp to be deleted as a Date Object (not inclusive).
- * @param options An Object defining batch configurations to be used. See README.md for more information.
- *                Option batchSize is determined by the maximum number of time series rows to be deleted across
- *                all ids given.
- * @returns {Promise<{success: Array, errors: Array<{errors: String, args: Array}>}>}
- *          - success: Return the responses of hisDelete operations if options.returnResult is true.
- *          - errors: Return the errors encountered from hisDelete operations.
- */
-async function hisDelete(ids, timeStart, timeEnd, options={}) {
-    if (!(timeStart instanceof Date) || !(timeEnd instanceof Date)) {
-        throw new Error("parameter timeStart or timeEnd is not of type Date");
-    }
-
-    await BATCH_HIS_DELETE_SCHEMA.validate(options);
-    options = deriveFromDefaults(this.clientOptions.batch.hisDelete, options);
-    const { batchSize, batchSizeEntity } = options;
-
-    // Create batch of ids
-    let idsAsBatch = [];
-    if (ids.length > batchSizeEntity) {
-        const idsCopy = [...ids];
-        while (idsCopy.length) {
-            idsAsBatch.push(idsCopy.splice(0, batchSizeEntity));
-        }
+async function hisDelete(ids, range, endOrOptions, maybeOptions) {
+    let options;
+    if (typeof range === "string") {
+        options = endOrOptions || {};
+    } else if (range instanceof Date && endOrOptions instanceof Date) {
+        range = `s:${range.toISOString()},${endOrOptions.toISOString()}`;
+        options = maybeOptions || {};
     } else {
-        idsAsBatch.push(ids);
+        throw new Error("range must be a Haystack range string, or timeStart and timeEnd must both be Date objects");
+    }
+    ids = Array.isArray(ids) ? ids : [ids];
+    if (ids.length === 0) {
+        return { success: [], errors: [] };
     }
 
-    const errorsEncountered = [];
-    // Create time range batches in terms of each batch of ids
-    const batches = init2DArray(idsAsBatch.length);
-    for (let i = 0; i < idsAsBatch.length; i++) {
-        let idsInBatch = idsAsBatch[i];
-        let { success: data, errors } = await this.batch.hisRead(idsInBatch, timeStart, timeEnd);
-        if (errors.length) {
-            // pass the errors encountered to the user
-            for (const error of errors) {
-                errorsEncountered.push(error);
-            }
+    // null means "not supplied": drop it so the configured/default value applies instead of
+    // silently disabling bisection or retry.
+    options = lodash.omitBy(options, lodash.isNull);
+    await BATCH_HIS_DELETE_SCHEMA.validate(options);
+    const configured = lodash.get(this.options, "client.batch.hisDelete") || {};
+    const resolved = deriveFromDefaults(this.clientOptions.batch.hisDelete, { ...options });
+    this.logger.debug("batch.hisDelete options: %s", HIS_DELETE_OPTION_KEYS.map((k) => {
+        const source = options[k] !== undefined ? "call" : configured[k] !== undefined ? "client config" : "default";
+        return `${k}=${JSON.stringify(resolved[k])} (${source})`;
+    }).join(", "));
 
-            // purge the ids and data for which a hisRead could not be performed on
-            const newIds = [];
-            const newData = [];
-            for (let i = 0; i < data.length; i++) {
-                if (data[i].length !== 0) {
-                    newIds.push(idsInBatch[i]);
-                    newData.push(data[i]);
+    const { batchSizeEntity, maxBisectDepth, retries, retryDelay, returnResult } = resolved;
+    const parsed = parseRange(range);
+    const success = [];
+    const errors = [];
+    const requests = [];
+    // Relative ranges resolve against one "now" for the whole call.
+    const nowMs = Date.now();
+    // A range that cannot be cut into requests of at most batchSize rows is not sent at all.
+    const notSent = (groupIds, reason) => {
+        this.logger.warn("batch.hisDelete: not deleting %s over %s: %s", groupIds.join(","), range, reason);
+        errors.push({ error: `not sent: ${reason}`, args: ["plan", groupIds, range] });
+    };
+
+    // At most batchSize points per request as well: points often log on the same instants, and
+    // rows sharing one millisecond cannot be split by time.
+    const groups = chunkIds(ids, Math.min(batchSizeEntity, resolved.batchSize));
+    // Planning can take many count queries, so it reports progress per group, on its own counter
+    // before the delete counter, and logs it: info at the start and end, debug per group, trace
+    // per count query.
+    const planningStarted = Date.now();
+    let countQueries = 0;
+    let rowsPlanned = 0;
+    this.logger.info("batch.hisDelete: planning %d points in %d groups over %s",
+        ids.length, groups.length, range);
+    const planning = createProgressCounter.call(this, "hisDelete", groups.length, options.progress,
+        { phase: "planning", points: ids.length });
+    const groupPlanned = (index, group, groupStarted, groupRequests, groupQueries) => {
+        const groupRows = groupRequests.reduce((n, req) => n + (req.rows || 0), 0);
+        rowsPlanned += groupRows;
+        this.logger.debug("batch.hisDelete: planned group %d/%d (%d points): %d requests, %d rows " +
+            "from %d count queries in %d ms", index + 1, groups.length, group.length, groupRequests.length,
+            groupRows, groupQueries, Date.now() - groupStarted);
+        planning.advance(index + 1, {
+            phase: "planning", points: ids.length, requestsPlanned: requests.length, rowsPlanned, countQueries
+        });
+    };
+
+    try {
+        for (const [index, group] of groups.entries()) {
+            const groupStarted = Date.now();
+            const groupQueriesBefore = countQueries;
+            const groupRequestsBefore = requests.length;
+            const finishGroup = () => groupPlanned(index, group, groupStarted,
+                requests.slice(groupRequestsBefore), countQueries - groupQueriesBefore);
+            if (!parsed.plannable) {
+                notSent(group, `"${parsed.raw}" is not a range batch.hisDelete can split: use two dates, one date, ` +
+                    "today, yesterday, or two datetimes with seconds and the same timezone name");
+                finishGroup();
+                continue;
+            }
+            // Datetime ends carry their own timezone, so the whole group shares one window. Date-only
+            // ends resolve in each point's timezone, so the group is read once and split by tz.
+            let subGroups = [{ ids: group }];
+            if (parsed.form === "date") {
+                try {
+                    subGroups = await groupByZone((groupIds) => withRetry(() => this.read(groupIds), { retries, retryDelay }), group);
+                } catch (error) {
+                    errors.push({ error: error.message, args: ["countQuery", group, range] });
+                    finishGroup();
+                    continue;
                 }
             }
-            data = newData;
-            idsInBatch = newIds;
+            for (const sub of subGroups) {
+                const window = windowFor(parsed, sub, nowMs);
+                if (window.unsplittable) {
+                    notSent(sub.ids, window.unsplittable);
+                    continue;
+                }
+                // Planning queries retry like deletes: a caller who sets retries expects planning to
+                // ride out the same transient failures.
+                const countFn = async (fromMs, toMs, unit) => {
+                    countQueries++;
+                    const buckets = parseCountResponse(await withRetry(
+                        () => this.query(buildCountQuery(sub.ids, fromMs, toMs, unit)), { retries, retryDelay }), unit);
+                    this.logger.trace("batch.hisDelete: count by %s over %s..%s for %d points: %d buckets, %d rows",
+                        unit, new Date(fromMs).toISOString(), new Date(toMs).toISOString(), sub.ids.length,
+                        buckets.length, buckets.reduce((n, b) => n + b.count, 0));
+                    return buckets;
+                };
+                let plan;
+                try {
+                    plan = await planGroup(countFn, sub.ids, parsed, window, resolved);
+                } catch (error) {
+                    errors.push({ error: error.message, args: ["countQuery", sub.ids, range] });
+                    continue;
+                }
+                if (plan.overBudget) {
+                    notSent(sub.ids, plan.overBudget);
+                } else {
+                    requests.push(...plan.requests);
+                }
+            }
+            finishGroup();
         }
-
-        if (idsInBatch.length === 0 || data.filter((dataSet) => dataSet.length > 0).length === 0) {
-            // no data to delete
-            continue;
-        }
-
-        createTimeRanges(
-            data,
-            idsInBatch,
-            batches[i],
-            batchSize,
-            findStartTime(data),
-            timeEnd
-        );
+    } finally {
+        planning.release();
     }
+    this.logger.info("batch.hisDelete: planned %d requests, %d rows from %d count queries in %d ms",
+        requests.length, rowsPlanned, countQueries, Date.now() - planningStarted);
 
-    if (batches.filter((idBatch) => idBatch.length > 0).length === 0) {
-        return {
-            success: [],
-            errors: errorsEncountered
+    // Resolves to the request's outcome for progress reporting: ok, the retries used (including
+    // any bisected halves') and, on failure, the last error.
+    const runRequest = async (req) => {
+        let retriesUsed = 0;
+        const onRetry = (error) => {
+            retriesUsed++;
+            this.logger.debug("batch.hisDelete: delete over %s failed, retry %d: %s",
+                req.range, retriesUsed, error && error.message);
         };
-    }
-
-    const batchFlattened = [];
-    for (const idBatch of batches) {
-        for (const batchForIds of idBatch) {
-            batchFlattened.push(batchForIds);
+        try {
+            this.logger.trace("batch.hisDelete: deleting %s for %d points (%d rows planned)",
+                req.range, req.ids.length, req.rows || 0);
+            const res = await withRetry(() => this.hisDelete(req.ids, req.range), { retries, retryDelay, onRetry });
+            if (returnResult) {
+                success.push(res);
+            }
+            return { ok: true, retries: retriesUsed };
+        } catch (error) {
+            const halves = isRecordLimitError(error) && req.depth < maxBisectDepth ? splitRequest(req) : null;
+            if (halves) {
+                this.logger.warn("batch.hisDelete: record limit hit for %s; bisecting (depth %d/%d)",
+                    req.range, req.depth + 1, maxBisectDepth);
+                const outcome = { ok: true, retries: retriesUsed };
+                for (const half of halves) {
+                    const halfOutcome = await runRequest(half);
+                    outcome.retries += halfOutcome.retries;
+                    if (!halfOutcome.ok) {
+                        outcome.ok = false;
+                        outcome.error = halfOutcome.error;
+                    }
+                }
+                return outcome;
+            }
+            errors.push({ error: error.message, args: ["hisDelete", req.ids, req.range] });
+            return { ok: false, retries: retriesUsed, error: error.message };
         }
-    }
-
-    const opResult = await this.performOpInBatch(
-        "hisDelete",
-        [batchFlattened],
-        {
-            ...options,
-            batchSize: 1,           // batches are based on the time ranges to be deleted
-            transformer: (batch) => batch[0]
-        }
-    );
-
-    // join the result with any errors encountered
-    return {
-        success: opResult.success,
-        errors: [...errorsEncountered, ...opResult.errors]
     };
+
+    // The engine only paces and parallelises here; runRequest records its own results so that
+    // bisected halves and original errors are kept, and retries on its own (retries: 0 keeps a
+    // client-wide performOpInBatch.retries from retrying on top). The receiver is a stand-in so
+    // the dispatch name never lands on the shared client instance.
+    const runner = Object.create(this);
+    runner.runHisDeleteRequest = async (req) => ({ ...(await runRequest(req)), size: req.rows || 0 });
+    await this.performOpInBatch.call(runner, "runHisDeleteRequest", [[...requests]], {
+        batchSize: 1,
+        transformer: (batch) => batch[0],
+        parallel: resolved.parallel,
+        batchDelay: resolved.batchDelay,
+        parallelDelay: resolved.parallelDelay,
+        returnResult: false,
+        retries: 0,
+        progress: options.progress,
+        label: "hisDelete",
+        unit: "rows",
+        progressPayload: { phase: "deleting", rowsTotal: rowsPlanned },
+        // runRequest records its own failures and retries; report them per request.
+        describe: ({ ok, error, retries: retriesUsed, size }) => ({ ok, error, retries: retriesUsed, size })
+    });
+
+    return { success, errors };
 }
 
 /**
@@ -849,17 +1110,21 @@ async function updateByFilter(filter, criteriaList, options={}) {
 
 /**
  * Perform a hisDelete using a filter to select the entities.
- * @param filter Filter to select the entities to be hisDelete'd.
- * @param start Starting timestamp to be deleted as a Date Object.
- * @param end Ending timestamp to be deleted as a Date Object (not inclusive).
- * @param options An Object defining batch configurations to be used. See README.md for more information.
- *                Option batchSize is determined by the maximum number of time series rows to be deleted across
- *                all ids given.
+ * @param {string} filter Filter to select the entities to be hisDelete'd.
+ * @param {Date} start Starting timestamp to be deleted.
+ * @param {Date} end Ending timestamp to be deleted (not inclusive).
+ * @param {Object} [options] Options for batch.hisDelete plus `limit` (see docs/client/batch.md). Options not given
+ *                come from client config batch.hisDeleteByFilter, then its defaults; batch.hisDelete client
+ *                config does not apply on this path. batchSize bounds the total rows per request.
  * @returns {Promise<{success: Array, errors: Array<{errors: String, args: Array}>}>}
  *          - success: Return the result of each successful hisDelete operation when options.returnResult is true.
  *          - errors: Return any errors encountered when performing hisDelete operations.
  */
 async function hisDeleteByFilter(filter, start, end, options={}) {
+    // Only Dates, as before the planner: a range string belongs to batch.hisDelete.
+    if (!(start instanceof Date) || !(end instanceof Date)) {
+        throw new Error("parameter timeStart or timeEnd is not of type Date");
+    }
     await BATCH_HIS_DELETE_BY_FILTER_SCHEMA.validate(options);
     options = deriveFromDefaults(this.clientOptions.batch.hisDeleteByFilter, options);
     const { limit } = options;

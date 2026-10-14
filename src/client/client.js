@@ -79,6 +79,47 @@ function makeEmailLookupError(message, email) {
  */
 const SKIP_IMPERSONATE_JOIN = Symbol('skipImpersonateJoin');
 
+/**
+ * Credential-bearing keys masked in anything handed to the logger. A
+ * constant, not an option: redaction that a site could switch off is a
+ * credential leak waiting to happen.
+ */
+const REDACTED = '[REDACTED]';
+const REDACTED_KEYS = Object.freeze(['authorization', 'password', 'newpassword',
+    'client_secret', 'refresh_token', 'access_token']);
+
+/**
+ * Deep copy of a request body or config with every credential-bearing key
+ * masked, for logging only. The original object is never modified.
+ * @param {*} value
+ * @param {WeakSet} [path] Objects on the current path, for cycle detection.
+ * @returns {*}
+ */
+function redactForLog(value, path = new WeakSet()) {
+    // Buffers and multipart forms pass through untouched (Buffer is absent
+    // in the browser build, hence the typeof guard).
+    if (value === null || typeof value !== 'object'
+            || (typeof Buffer !== 'undefined' && Buffer.isBuffer(value))
+            || typeof value.getBoundary === 'function') {
+        return value;
+    }
+    if (path.has(value)) {
+        return '[Circular]';
+    }
+    path.add(value);
+    let out;
+    if (Array.isArray(value)) {
+        out = value.map((v) => redactForLog(v, path));
+    } else {
+        out = {};
+        for (const [key, val] of Object.entries(value)) {
+            out[key] = REDACTED_KEYS.includes(key.toLowerCase()) ? REDACTED : redactForLog(val, path);
+        }
+    }
+    path.delete(value);
+    return out;
+}
+
 // Check for the runtime
 let runtimeEnv;
 if (typeof (process) !== 'undefined' && process.versions) {
@@ -242,6 +283,8 @@ class WideSkyClient {
         this.logger = initLogger(logger);
         this.options = options;
         this.clientOptions = null;
+        // Capabilities callers can feature-detect without reading package metadata.
+        this.features = Object.freeze({ hisDeletePlanner: true, batchProgress: true });
         this._impersonate = null;
         this._impersonatePendingEmail = null;
         this._impersonateLookup = null;
@@ -857,8 +900,8 @@ class WideSkyClient {
         const uri = this.baseUri + uriPath;
 
         /* istanbul ignore next */
-        if (this.logger) {
-            this.logger.trace(config, 'Raw request');
+        if (this.logger && this.logger.trace()) {
+            this.logger.trace(redactForLog(config), 'Raw request');
         }
 
         const axiosCall = () => {
@@ -1005,7 +1048,9 @@ class WideSkyClient {
         // the retry settles.
         const dispatchWithRetry = async () => {
             this.logger.info("Submitting request [%s] %s", method.toUpperCase(), uri);
-            this.logger.debug("With body %j and config %j", body, config);
+            if (this.logger.debug()) {
+                this.logger.debug("With body %j and config %j", redactForLog(body), redactForLog(config));
+            }
             try {
                 return await this._wsRawSubmit(method, uri, body, config);
             }
@@ -1759,9 +1804,13 @@ class WideSkyClient {
                 status.rowTs[ts] = out_row;
             }
 
-            /* Copy the columns in */
+            /* Copy the columns in. The server names the value column `val`
+             * when the block holds one point, and v0..vN for several. */
             for (let c = 0; c < blockIds.length; c++) {
-                const val = in_row['v' + c];
+                let val = in_row['v' + c];
+                if ((val == null) && (blockIds.length === 1)) {
+                    val = in_row.val;
+                }
 
                 if (val != null) {
                     const id = blockIds[c];

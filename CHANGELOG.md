@@ -4,6 +4,38 @@ This project adheres to [Semantic Versioning](http://semver.org/).
 
 ## [Unreleased]
 
+## [3.6.0] - 2026-10-14
+
+### Added
+- [CORE-9592](https://widesky.atlassian.net/browse/CORE-9592): Batch operations report progress per request and log each request's outcome.
+  - A `progress` reporter can be given per call; `RequestProgress` is a ready-made line-based reporter.
+  - Each request is logged at debug level with its duration, retries and size, and each operation ends with an info summary.
+  - `client.features.batchProgress` reports that the client supports this.
+  - `batch.hisDelete` also reports planning progress per group of points, before any delete is sent.
+  - Batch operations log at trace (each request sent, each count query), debug (start, summary, each request, retry and planned group) and info (start and end of delete planning only).
+- [CORE-9209](https://widesky.atlassian.net/browse/CORE-9209): `batch.hisDelete` options `maxBisectDepth`, `countBucketUnits`, `retries` and `retryDelay`, and `client.features.hisDeletePlanner` for feature detection.
+- [CORE-9209](https://widesky.atlassian.net/browse/CORE-9209): `retries` and `retryDelay` options for every batch operation, retrying requests that fail with a 500/502/503/504 or network error.
+
+### Changed
+- [CORE-9592](https://widesky.atlassian.net/browse/CORE-9592): Client-wide `progress` counters now count requests, advance as each request completes and are removed when the operation ends.
+  - With cli-progress, a finished bar is cleared from the terminal.
+  - A fractional `batchSize` or `batchSizeEntity` is rounded down to a whole number of items or entities per request.
+- [CORE-9209](https://widesky.atlassian.net/browse/CORE-9209): `batch.hisDelete` sizes deletes from server-side record counts instead of reading every row first, and accepts a Haystack range string as well as two Dates.
+  - A request now holds at most 500 rows in total across at most 10 points (was 1500 rows per point / 100 points).
+  - Requests rejected for the per-point record limit are halved and retried, up to `maxBisectDepth` times.
+  - A range split into several requests keeps one form the server accepts; a date range is split in each point's timezone.
+  - `today`, `yesterday` and a single date are split like a date range, in each point's timezone.
+  - Ranges it cannot split within the row limit (mixed forms, no seconds, points without a timezone) are reported and not deleted.
+  - `batch.hisDeleteByFilter` uses the same planner, new defaults (500 / 10) and the new options.
+- [CORE-9656](https://widesky.atlassian.net/browse/CORE-9656): Proxy behaviour changes with the axios 1.20 upgrade; check deployments that set a proxy.
+  - HTTPS requests through a proxy (`HTTPS_PROXY` or the `proxy` option) now go over a CONNECT tunnel.
+  - `NO_PROXY` entries match exact host names only; use a leading `.` or `*` to cover subdomains.
+
+### Fixed
+- [CORE-9209](https://widesky.atlassian.net/browse/CORE-9209): `batch.hisRead` and `hisRead` return each point's history on that point when a request fails, the points span several requests, or a request holds one point.
+- [CORE-9656](https://widesky.atlassian.net/browse/CORE-9656): axios upgraded to 1.20.0, clearing its 32 known security advisories (12 high), including credential-leak issues.
+- [CORE-9673](https://widesky.atlassian.net/browse/CORE-9673): Access tokens, the OAuth client secret and user passwords no longer appear in debug or trace logs.
+
 ## [3.5.0] - 2026-08-13
 
 ### Added
@@ -500,6 +532,8 @@ duplicated, even in the case where a package's version was unpublished. This is 
 - Alpha release
 
 [Unreleased]: https://github.com/widesky/jswidesky-client/compare/master...3.4.1
+[3.6.0]: https://github.com/widesky/jswidesky-client/compare/3.6.0...3.5.0
+[3.5.0]: https://github.com/widesky/jswidesky-client/compare/3.5.0...3.4.1
 [3.4.1]: https://github.com/widesky/jswidesky-client/compare/3.4.1...3.4.0
 [3.4.0]: https://github.com/widesky/jswidesky-client/compare/3.4.0...3.3.1
 [3.3.1]: https://github.com/widesky/jswidesky-client/compare/3.3.1...3.3.0

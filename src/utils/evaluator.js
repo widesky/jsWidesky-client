@@ -7,10 +7,19 @@ const HIS_WRITE_BATCH_SIZE  = 10000;
 const HIS_WRITE_BATCH_SIZE_MAX = 20000;
 const HIS_WRITE_ENTITY_BATCH_SIZE = 100;
 const HIS_WRITE_ENTITY_BATCH_SIZE_MAX = 1000;
-const HIS_DELETE_DATA_POINT_BATCH_SIZE = 1500;
+// hisDelete budget: rows per request summed over ALL its points, not per point. Deliberately
+// conservative: it bounds the work (and InfluxDB load) of each delete request, and so stays well
+// under the API server's 1500 rows-per-entity reject threshold whatever the mix of points. The
+// cost is more count queries and deletes for large deletes; sites can raise batchSize (max 3000).
+const HIS_DELETE_DATA_POINT_BATCH_SIZE = 500;
 const HIS_DELETE_DATA_POINT_BATCH_SIZE_MAX = 3000;
-const HIS_DELETE_ENTITY_BATCH_SIZE = 100;
+const HIS_DELETE_ENTITY_BATCH_SIZE = 10;
 const HIS_DELETE_ENTITY_BATCH_SIZE_MAX = 1000;
+const HIS_DELETE_MAX_BISECT_DEPTH = 5;
+const HIS_DELETE_MAX_BISECT_DEPTH_MAX = 10;
+// GraphQL `duration` enum values usable as histogram levels, coarsest first.
+const HIS_DELETE_BUCKET_UNIT_ORDER = ["WEEK", "DAY", "HOUR", "MINUTE", "SECOND"];
+const HIS_DELETE_COUNT_BUCKET_UNITS = ["DAY", "HOUR", "MINUTE"];
 const CREATE_BATCH_SIZE = 2000;
 const CREATE_BATCH_SIZE_MAX = 10000;
 const UPDATE_BATCH_SIZE = 2000;
@@ -23,6 +32,10 @@ const READ_BY_FILTER_BATCH_SIZE_MAX = 200;
 const PERFORM_OP_IN_BATCH_BATCH_SIZE = 100;
 const PERFORM_OP_IN_BATCH_MAX_BATCH_SIZE = 10 ** 9;
 const PERFORM_OP_IN_BATCH_MAX_PARALLEL = 100;
+// Extra attempts per batched request after a transient failure. Capped so a misconfigured site
+// cannot hold a batch open retrying one request indefinitely.
+const BATCH_RETRIES_MAX = 10;
+const BATCH_RETRY_DELAY = 2000;
 
 function deriveFromDefaults(defaultConfig, passedConfig) {
     for (const [key, value] of Object.entries(defaultConfig)) {
@@ -83,7 +96,23 @@ const PERFORM_OP_IN_BATCH_OBJ = {
         .nullable()
         .strict()
         .min(0)
-        .default(0)
+        .default(0),
+    // Retry each batched request after a transient failure (see client/functions/batchRetry.js).
+    retries: yup.number()
+        .notRequired()
+        .nullable()
+        .strict()
+        .integer()
+        .min(0)
+        .max(BATCH_RETRIES_MAX)
+        .default(0),
+    retryDelay: yup.number()
+        .notRequired()
+        .nullable()
+        .strict()
+        .integer()
+        .min(0)
+        .default(BATCH_RETRY_DELAY)
 };
 
 // Client function schema for options arguments
@@ -105,6 +134,26 @@ const BATCH_HIS_DELETE_SCHEMA = yup.object({
     ...PERFORM_OP_IN_BATCH_OBJ,
     ...getBatchProp(HIS_DELETE_DATA_POINT_BATCH_SIZE, HIS_DELETE_DATA_POINT_BATCH_SIZE_MAX),
     ...getBatchProp(HIS_DELETE_ENTITY_BATCH_SIZE, HIS_DELETE_ENTITY_BATCH_SIZE_MAX, "batchSizeEntity"),
+    maxBisectDepth: yup.number()
+        .notRequired()
+        .nullable()
+        .strict()
+        .integer()
+        .min(0)
+        .max(HIS_DELETE_MAX_BISECT_DEPTH_MAX)
+        .default(HIS_DELETE_MAX_BISECT_DEPTH),
+    // Not nullable: the planner always needs at least one level.
+    countBucketUnits: yup.array()
+        .of(yup.string().oneOf(HIS_DELETE_BUCKET_UNIT_ORDER))
+        .strict()
+        .min(1)
+        .test(
+            "coarse-to-fine",
+            "countBucketUnits must be ordered coarse to fine without duplicates",
+            (units) => units == null || units.every((unit, i) => i === 0 ||
+                HIS_DELETE_BUCKET_UNIT_ORDER.indexOf(unit) > HIS_DELETE_BUCKET_UNIT_ORDER.indexOf(units[i - 1]))
+        )
+        .default(() => [...HIS_DELETE_COUNT_BUCKET_UNITS]),
     ...getReturnResultProp(false)
 });
 const BATCH_CREATE_SCHEMA = yup.object({
@@ -148,6 +197,26 @@ const BATCH_HIS_DELETE_BY_FILTER_SCHEMA = yup.object({
     ...PERFORM_OP_IN_BATCH_OBJ,
     ...getBatchProp(HIS_DELETE_DATA_POINT_BATCH_SIZE, HIS_DELETE_DATA_POINT_BATCH_SIZE_MAX),
     ...getBatchProp(HIS_DELETE_ENTITY_BATCH_SIZE, HIS_DELETE_ENTITY_BATCH_SIZE_MAX, "batchSizeEntity"),
+    maxBisectDepth: yup.number()
+        .notRequired()
+        .nullable()
+        .strict()
+        .integer()
+        .min(0)
+        .max(HIS_DELETE_MAX_BISECT_DEPTH_MAX)
+        .default(HIS_DELETE_MAX_BISECT_DEPTH),
+    // Not nullable: the planner always needs at least one level.
+    countBucketUnits: yup.array()
+        .of(yup.string().oneOf(HIS_DELETE_BUCKET_UNIT_ORDER))
+        .strict()
+        .min(1)
+        .test(
+            "coarse-to-fine",
+            "countBucketUnits must be ordered coarse to fine without duplicates",
+            (units) => units == null || units.every((unit, i) => i === 0 ||
+                HIS_DELETE_BUCKET_UNIT_ORDER.indexOf(unit) > HIS_DELETE_BUCKET_UNIT_ORDER.indexOf(units[i - 1]))
+        )
+        .default(() => [...HIS_DELETE_COUNT_BUCKET_UNITS]),
     ...getReturnResultProp(false),
     ...LIMIT_PROPERTY
 });
@@ -256,5 +325,6 @@ module.exports = {
     BATCH_ADD_CHILDREN_BY_FILTER_SCHEMA,
     BATCH_MULTI_FIND_SCHEMA,
     BATCH_UPDATE_OR_CREATE_SCHEMA,
+    HIS_DELETE_BUCKET_UNIT_ORDER,
     deriveFromDefaults
 };
